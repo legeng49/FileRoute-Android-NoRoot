@@ -21,8 +21,10 @@
         android:largeScreens="true"
         android:xlargeScreens="true" />
 
+    <!-- Android 17 (API 37) 强制大屏自适应合规：无方向锁定，完全支持自由窗口与预测性返回 -->
     <application
         android:allowBackup="true"
+        android:enableOnBackInvokedCallback="true"
         android:label="归位 FileRoute"
         android:resizeableActivity="true"
         android:supportsRtl="true"

@@ -5,6 +5,7 @@ import android.app.PendingIntent
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.media.MediaScannerConnection
 import android.os.Build
 import android.os.Environment
 import android.provider.MediaStore
@@ -78,8 +79,15 @@ class DownloadTriggerWorker(
                                 val finalName = DefaultRuleRepository.formatFileName(
                                     rule.renamePattern, rule.appName, file.name
                                 )
-                                file.copyTo(File(dstDir, finalName), overwrite = true)
+                                val dstFile = File(dstDir, finalName)
+                                file.copyTo(dstFile, overwrite = true)
                                 if (rule.action == RouteAction.AUTO_MOVE) file.delete()
+                                MediaScannerConnection.scanFile(
+                                    applicationContext,
+                                    arrayOf(dstFile.absolutePath),
+                                    null,
+                                    null
+                                )
                             }
                         } else {
                             postPromptBanner(rule.appName, file, targetDir)

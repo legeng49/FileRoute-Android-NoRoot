@@ -1,4 +1,4 @@
-name: Build FileRoute Android APK
+name: Build FileRoute Android 17 APK
 
 on:
   push:
@@ -20,32 +20,51 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
-      - name: Setup Gradle
+      - name: Setup Android SDK (API 37)
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android 17 Platform (API 37)
+        run: |
+          yes | sdkmanager --licenses > /dev/null || true
+          sdkmanager "platforms;android-37"
+
+      - name: Setup Gradle 8.11
         uses: gradle/actions/setup-gradle@v4
         with:
-          gradle-version: '8.9'
+          gradle-version: '8.11.1'
 
       - name: Build Debug APK
         run: gradle assembleDebug
 
       - name: Rename APK
-        run: mv app/build/outputs/apk/debug/app-debug.apk FileRoute-v1.0.0-debug.apk
+        run: mv app/build/outputs/apk/debug/app-debug.apk FileRoute-v2.0.0-android17-debug.apk
 
       - name: Upload APK Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: FileRoute-debug-apk
-          path: FileRoute-v1.0.0-debug.apk
+          name: FileRoute-android17-debug-apk
+          path: FileRoute-v2.0.0-android17-debug.apk
 
       - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          if gh release view "v1.0.0" >/dev/null 2>&1; then
-            gh release upload "v1.0.0" "FileRoute-v1.0.0-debug.apk" --clobber
+          notes=$(cat <<'EOF'
+          适配 Android 17（API 37，targetSdk 37）。v1.0.0 仅适配到 Android 15（API 35）。
+
+          - dataSync 前台服务超时后交给 WorkManager 与 MediaStore 触发
+          - 归位后立即扫描媒体库
+          - 大屏与平板自适应布局
+          - Edge-to-edge 与预测性返回
+
+          最低系统 Android 8.0（API 26）。安装包：FileRoute-v2.0.0-android17-debug.apk
+          EOF
+          )
+          if gh release view "v2.0.0-android17" >/dev/null 2>&1; then
+            gh release upload "v2.0.0-android17" "FileRoute-v2.0.0-android17-debug.apk" --clobber
           else
-            gh release create "v1.0.0" "FileRoute-v1.0.0-debug.apk" \
-              --title "归位 FileRoute v1.0.0" \
-              --notes "调试版 APK，下载后可直接安装到手机。" \
+            gh release create "v2.0.0-android17" "FileRoute-v2.0.0-android17-debug.apk" \
+              --title "归位 FileRoute v2.0.0（Android 17）" \
+              --notes "$notes" \
               --latest
           fi

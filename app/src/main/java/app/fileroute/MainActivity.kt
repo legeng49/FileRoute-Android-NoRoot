@@ -7,9 +7,11 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Environment
 import android.provider.Settings
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -26,6 +28,7 @@ import app.fileroute.worker.DownloadTriggerWorker
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
+        enableEdgeToEdge()
         super.onCreate(savedInstanceState)
         setContent {
             MaterialTheme {
@@ -53,7 +56,7 @@ fun FileRouteAdaptiveScreen() {
 
     Scaffold(
         topBar = {
-            TopAppBar(title = { Text("归位 FileRoute · 免 Root") })
+            TopAppBar(title = { Text("归位 FileRoute · Android 17") })
         }
     ) { padding ->
         // 平板 / 折叠屏大屏自适应：宽度 >= 600dp 自动切换为左右双栏布局
@@ -119,7 +122,17 @@ fun FileRouteAdaptiveScreen() {
                                     if (useEventTriggeredMode) {
                                         DownloadTriggerWorker.scheduleNextTrigger(context)
                                     } else {
-                                        context.startForegroundService(svcIntent)
+                                        runCatching {
+                                            context.startForegroundService(svcIntent)
+                                        }.onFailure {
+                                            // Android 17 前台服务启动受限时自动回退至 MediaStore 触发式唤醒
+                                            DownloadTriggerWorker.scheduleNextTrigger(context)
+                                            Toast.makeText(
+                                                context,
+                                                "系统限制前台服务启动，已自动切换为 MediaStore 触发式唤醒",
+                                                Toast.LENGTH_SHORT
+                                            ).show()
+                                        }
                                     }
                                     triggerArmed = true
                                 }

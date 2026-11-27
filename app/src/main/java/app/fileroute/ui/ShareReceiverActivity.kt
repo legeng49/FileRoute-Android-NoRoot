@@ -1,12 +1,15 @@
 package app.fileroute.ui
 
 import android.content.Intent
+import android.media.MediaScannerConnection
 import android.net.Uri
 import android.os.Bundle
 import android.provider.OpenableColumns
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
+import androidx.core.content.IntentCompat
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
@@ -20,7 +23,7 @@ import app.fileroute.service.DownloadMonitorService
 import java.io.File
 
 /**
- * 透明底部的目录选择器弹窗：
+ * 透明底部的目录选择器弹窗（已适配 Android 17 Edge-to-Edge 与 IntentCompat）：
  * 1. 当用户在 QQ / TIM 中点击「用其他应用打开」或「分享 → 归位」时直接弹出（无需 Shizuku）
  * 2. 当用户点击顶部系统通知横幅时直接弹出
  */
@@ -28,10 +31,11 @@ class ShareReceiverActivity : ComponentActivity() {
 
     @OptIn(ExperimentalMaterial3Api::class)
     override fun onCreate(savedInstanceState: Bundle?) {
+        enableEdgeToEdge()
         super.onCreate(savedInstanceState)
 
         val sharedUri: Uri? = if (intent.action == Intent.ACTION_SEND) {
-            intent.getParcelableExtra(Intent.EXTRA_STREAM)
+            IntentCompat.getParcelableExtra(intent, Intent.EXTRA_STREAM, Uri::class.java)
         } else if (intent.action == Intent.ACTION_VIEW) {
             intent.data
         } else {
@@ -155,6 +159,12 @@ class ShareReceiverActivity : ComponentActivity() {
             } else {
                 return false
             }
+            MediaScannerConnection.scanFile(
+                applicationContext,
+                arrayOf(targetFile.absolutePath),
+                null,
+                null
+            )
             true
         }.getOrDefault(false)
     }

@@ -6,6 +6,7 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
 import android.content.Intent
+import android.media.MediaScannerConnection
 import android.os.Build
 import android.os.FileObserver
 import android.os.IBinder
@@ -15,11 +16,13 @@ import app.fileroute.data.ChannelMode
 import app.fileroute.data.DefaultRuleRepository
 import app.fileroute.data.RouteAction
 import app.fileroute.ui.ShareReceiverActivity
+import app.fileroute.worker.DownloadTriggerWorker
 import java.io.File
 
 /**
- * 公共存储目录实时检测前台服务（免 Root / 免 Shizuku）
+ * 公共存储目录实时检测前台服务（Android 17 / API 37 适配 · 免 Root / 免 Shizuku）
  * 覆盖：微信 (Download/WeiXin)、新版 QQ (Download/QQ)、钉钉、飞书、浏览器等
+ * 已实现 onTimeout() 回调：达到 Android 15–17 dataSync 6 小时限额时自动移交 MediaStore 触发器
  */
 class DownloadMonitorService : Service() {
 
@@ -133,7 +136,23 @@ class DownloadMonitorService : Service() {
             val dstFile = File(dstDir, finalName)
             src.copyTo(dstFile, overwrite = true)
             if (!copyOnly) src.delete()
+            // Android 17 MediaStore 索引同步刷新，确保相册与文件管理器立即可见
+            MediaScannerConnection.scanFile(
+                applicationContext,
+                arrayOf(dstFile.absolutePath),
+                null,
+                null
+            )
         }
+    }
+
+    /**
+     * Android 15–17 (API 35–37) dataSync 前台服务 6 小时配额超时回调：
+     * 优雅停止前台服务并无缝交由 WorkManager + MediaStore 触发器接管，避免系统抛出异常
+     */
+    override fun onTimeout(startId: Int, fgsType: Int) {
+        DownloadTriggerWorker.scheduleNextTrigger(applicationContext)
+        stopSelf(startId)
     }
 
     private fun createNotificationChannels() {
@@ -152,7 +171,7 @@ class DownloadMonitorService : Service() {
         return NotificationCompat.Builder(this, CHANNEL_KEEPALIVE)
             .setSmallIcon(android.R.drawable.ic_menu_sort_by_size)
             .setContentTitle("归位 FileRoute 正在免 Root 守护下载目录")
-            .setContentText("已启用公共目录监听 · QQ 文件可通过分享菜单一键归位")
+            .setContentText("已适配 Android 17 · 超时将自动无缝切回 MediaStore 被动触发")
             .setOngoing(true)
             .build()
     }
