@@ -23,7 +23,16 @@ jobs:
       - name: Setup Android SDK (API 37)
         uses: android-actions/setup-android@v4
         with:
-          packages: platform-tools platforms;android-37
+          packages: platform-tools platforms;android-37.2
+
+      - name: Point compileSdk 37 at platform 37.2
+        run: |
+          set -euo pipefail
+          SDK="${ANDROID_SDK_ROOT:-$ANDROID_HOME}"
+          if [ ! -d "$SDK/platforms/android-37" ]; then
+            ln -s android-37.2 "$SDK/platforms/android-37"
+          fi
+          cat "$SDK/platforms/android-37/source.properties"
 
       - name: Setup Gradle 8.11
         uses: gradle/actions/setup-gradle@v4
