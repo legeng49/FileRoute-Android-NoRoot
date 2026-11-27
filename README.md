@@ -1,5 +1,11 @@
 # 归位 FileRoute v2.0 — Android 17（API 37）
 
+![归位 FileRoute 仓库封面](docs/FileRoute-AppCover-Android17.png)
+
+程序图标：
+
+![归位 FileRoute 程序图标](docs/FileRoute-AppIcon.png)
+
 免 Root、免 Shizuku。当前工程按 **Android 17** 构建（compileSdk 37 / targetSdk 37 / AGP 8.10 / Kotlin 2.1），规则来自网页端配置的 **7 条活跃规则**（5 条公共目录自动监听 + 2 条分享菜单一键归位）。
 
 最低安装系统仍是 Android 8.0（API 26）。「适配到 Android 17」指目标版本升到 API 37，不是只能装在 Android 17 上。
