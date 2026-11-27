@@ -199,10 +199,12 @@ object RuntimeStateStore {
             val stamp = SimpleDateFormat("yyyyMMdd_HHmm", Locale.ROOT).format(Date())
             val outFile = File(docsDir, "FileRoute_历史记录_$stamp.csv")
             val sb = StringBuilder()
-            sb.append("﻿时间,来源应用,文件名,大小,操作方式,状态,原路径,目标路径
-")
+            sb.append("时间,来源应用,文件名,大小,操作方式,状态,原路径,目标路径\n")
             historyItems.forEach { h ->
-                fun csvEsc(s: String) = ""${s.replace(""", """")}""
+                fun csvEsc(s: String): String {
+                    val escaped = s.replace("\"", "\"\"")
+                    return "\"$escaped\""
+                }
                 sb.append(
                     listOf(
                         csvEsc(h.timeText),
@@ -214,8 +216,7 @@ object RuntimeStateStore {
                         csvEsc(h.fromPath),
                         csvEsc(h.toPath)
                     ).joinToString(",")
-                ).append("
-")
+                ).append("\n")
             }
             outFile.writeText(sb.toString(), Charsets.UTF_8)
             MediaScannerConnection.scanFile(

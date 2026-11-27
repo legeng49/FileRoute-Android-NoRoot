@@ -93,8 +93,7 @@ object NotificationHelper {
             .setContentText("${file.name} · 点击选择目标目录归位")
             .setStyle(
                 NotificationCompat.BigTextStyle()
-                    .bigText("${file.name}
-建议归位 → $suggestedDir")
+                    .bigText("${file.name}\n建议归位 → $suggestedDir")
             )
             .setPriority(NotificationCompat.PRIORITY_HIGH)
             .setCategory(NotificationCompat.CATEGORY_MESSAGE)
