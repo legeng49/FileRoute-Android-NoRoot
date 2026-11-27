@@ -1,7 +1,6 @@
 package app.fileroute.ui
 
 import android.content.Intent
-import android.media.MediaScannerConnection
 import android.net.Uri
 import android.os.Bundle
 import android.provider.OpenableColumns
@@ -9,7 +8,6 @@ import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
-import androidx.core.content.IntentCompat
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
@@ -18,8 +16,11 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
+import androidx.core.content.IntentCompat
 import app.fileroute.data.DefaultRuleRepository
+import app.fileroute.data.RuntimeStateStore
 import app.fileroute.service.DownloadMonitorService
+import app.fileroute.util.DownloadDiscoveryEngine
 import java.io.File
 
 /**
@@ -33,32 +34,46 @@ class ShareReceiverActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         enableEdgeToEdge()
         super.onCreate(savedInstanceState)
+        RuntimeStateStore.ensureInit(applicationContext)
 
-        val sharedUri: Uri? = if (intent.action == Intent.ACTION_SEND) {
-            IntentCompat.getParcelableExtra(intent, Intent.EXTRA_STREAM, Uri::class.java)
-        } else if (intent.action == Intent.ACTION_VIEW) {
-            intent.data
-        } else {
-            null
+        val sharedUris: List<Uri> = when (intent.action) {
+            Intent.ACTION_SEND -> listOfNotNull(
+                IntentCompat.getParcelableExtra(intent, Intent.EXTRA_STREAM, Uri::class.java)
+            )
+            Intent.ACTION_SEND_MULTIPLE ->
+                IntentCompat.getParcelableArrayListExtra(intent, Intent.EXTRA_STREAM, Uri::class.java)
+                    ?.filterNotNull()
+                    .orEmpty()
+            Intent.ACTION_VIEW -> listOfNotNull(intent.data)
+            else -> emptyList()
         }
 
         val directFilePath = intent.getStringExtra(DownloadMonitorService.EXTRA_SOURCE_PATH)
         val sourceApp = intent.getStringExtra(DownloadMonitorService.EXTRA_APP_NAME)
-            ?: if (sharedUri != null) "QQ / 系统分享传入" else "未知来源"
-        val fileName = directFilePath?.let { File(it).name }
-            ?: sharedUri?.let { resolveDisplayName(it) }
+            ?: if (sharedUris.isNotEmpty()) "QQ / 系统分享传入" else "未知来源"
+        val primaryName = directFilePath?.let { File(it).name }
+            ?: sharedUris.firstOrNull()?.let { resolveDisplayName(it) }
             ?: "未命名文件"
+        val displayTitle = if (sharedUris.size > 1) {
+            "$primaryName 等 ${sharedUris.size} 个文件"
+        } else {
+            primaryName
+        }
+
+        val autoTarget = DefaultRuleRepository.resolveTargetDir(
+            rule = null,
+            fileName = primaryName,
+            smartClassifyEnabled = RuntimeStateStore.smartClassifyEnabled
+        ).first
         val initialSuggested = intent.getStringExtra(DownloadMonitorService.EXTRA_SUGGESTED_DIR)
-            ?: DefaultRuleRepository.quickFolders.first().path
+            ?: autoTarget
 
         setContent {
             MaterialTheme {
                 var selectedDir by remember { mutableStateOf(initialSuggested) }
-                var copyOnly by remember { mutableStateOf(sharedUri != null) }
+                var copyOnly by remember { mutableStateOf(sharedUris.isNotEmpty()) }
 
-                ModalBottomSheet(
-                    onDismissRequest = { finish() }
-                ) {
+                ModalBottomSheet(onDismissRequest = { finish() }) {
                     Column(
                         modifier = Modifier
                             .fillMaxWidth()
@@ -67,7 +82,7 @@ class ShareReceiverActivity : ComponentActivity() {
                     ) {
                         Text(text = "选择文件归位目录", style = MaterialTheme.typography.titleLarge)
                         Text(
-                            text = "$sourceApp · $fileName",
+                            text = "$sourceApp · $displayTitle",
                             style = MaterialTheme.typography.bodyMedium,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
@@ -86,7 +101,7 @@ class ShareReceiverActivity : ComponentActivity() {
                             verticalArrangement = Arrangement.spacedBy(8.dp),
                             modifier = Modifier.heightIn(max = 220.dp)
                         ) {
-                            items(DefaultRuleRepository.quickFolders) { folder ->
+                            items(RuntimeStateStore.quickFolders) { folder ->
                                 FilterChip(
                                     selected = selectedDir == folder.path,
                                     onClick = { selectedDir = folder.path },
@@ -108,16 +123,34 @@ class ShareReceiverActivity : ComponentActivity() {
 
                         Button(
                             onClick = {
-                                val ok = performRelocate(
-                                    directFilePath = directFilePath,
-                                    sharedUri = sharedUri,
-                                    fileName = fileName,
-                                    targetDirPath = selectedDir,
-                                    copyOnly = copyOnly
-                                )
+                                val ok = if (directFilePath != null) {
+                                    DownloadDiscoveryEngine.relocateFile(
+                                        context = applicationContext,
+                                        sourcePath = directFilePath,
+                                        sharedUri = null,
+                                        appName = sourceApp,
+                                        fileName = primaryName,
+                                        targetDirPath = selectedDir,
+                                        copyOnly = copyOnly
+                                    )
+                                } else if (sharedUris.isNotEmpty()) {
+                                    sharedUris.all { uri ->
+                                        DownloadDiscoveryEngine.relocateFile(
+                                            context = applicationContext,
+                                            sourcePath = null,
+                                            sharedUri = uri,
+                                            appName = sourceApp,
+                                            fileName = resolveDisplayName(uri),
+                                            targetDirPath = selectedDir,
+                                            copyOnly = true
+                                        )
+                                    }
+                                } else {
+                                    false
+                                }
                                 Toast.makeText(
                                     this@ShareReceiverActivity,
-                                    if (ok) "已归位至 $selectedDir" else "保存失败，请检查存储权限",
+                                    if (ok) "已归位至 $selectedDir" else "保存失败，请先在首页授予所有文件访问权限",
                                     Toast.LENGTH_SHORT
                                 ).show()
                                 finish()
@@ -134,39 +167,6 @@ class ShareReceiverActivity : ComponentActivity() {
                 }
             }
         }
-    }
-
-    private fun performRelocate(
-        directFilePath: String?,
-        sharedUri: Uri?,
-        fileName: String,
-        targetDirPath: String,
-        copyOnly: Boolean
-    ): Boolean {
-        return runCatching {
-            val targetDir = File(targetDirPath)
-            if (!targetDir.exists()) targetDir.mkdirs()
-            val targetFile = File(targetDir, fileName)
-
-            if (directFilePath != null) {
-                val src = File(directFilePath)
-                src.copyTo(targetFile, overwrite = true)
-                if (!copyOnly) src.delete()
-            } else if (sharedUri != null) {
-                contentResolver.openInputStream(sharedUri)?.use { input ->
-                    targetFile.outputStream().use { output -> input.copyTo(output) }
-                } ?: return false
-            } else {
-                return false
-            }
-            MediaScannerConnection.scanFile(
-                applicationContext,
-                arrayOf(targetFile.absolutePath),
-                null,
-                null
-            )
-            true
-        }.getOrDefault(false)
     }
 
     private fun resolveDisplayName(uri: Uri): String {

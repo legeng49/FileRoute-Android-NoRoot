@@ -14,8 +14,8 @@ android {
         applicationId = "app.fileroute"
         minSdk = 26
         targetSdk = 37
-        versionCode = 2
-        versionName = "2.0.0-android17"
+        versionCode = 3
+        versionName = "2.1.0-android17"
     }
 
     buildTypes {
@@ -48,4 +48,5 @@ dependencies {
     implementation("androidx.work:work-runtime-ktx:2.10.1")
     implementation("androidx.compose.ui:ui")
     implementation("androidx.compose.material3:material3")
+    implementation("androidx.compose.material:material-icons-core")
 }
