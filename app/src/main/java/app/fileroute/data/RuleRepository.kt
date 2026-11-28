@@ -32,7 +32,9 @@ data class AppRouteRule(
     val sourcePaths: List<String>,
     val defaultTargetDir: String,
     val renamePattern: String,
-    val subRules: List<ExtensionSubRule>
+    val subRules: List<ExtensionSubRule>,
+    val cleanupStrategy: String = "keep",
+    val cleanupDelayDays: Int = 7
 )
 
 data class DetectedDownloadItem(
@@ -68,7 +70,27 @@ data class DirectoryDiagItem(
     val readable: Boolean,
     val writable: Boolean,
     val fileCount: Int,
-    val latestFileName: String?
+    val latestFileName: String?,
+    val hint: String = ""
+)
+
+data class DiscoveredDeviceDir(
+    val path: String,
+    val inferredAppName: String,
+    val matchedRuleId: String?,
+    val ownerPackages: List<String>,
+    val fileCount: Int,
+    val latestFileName: String?,
+    val latestModifiedMillis: Long,
+    val discoverySource: String,
+    val alreadyBound: Boolean
+)
+
+data class RecentMediaSample(
+    val fileName: String,
+    val dirPath: String,
+    val ownerPackage: String,
+    val inferredAppName: String
 )
 
 object DefaultRuleRepository {
@@ -93,6 +115,60 @@ object DefaultRuleRepository {
 
     val initialRules: List<AppRouteRule> = listOf(
         AppRouteRule(
+            id = "rule-scan-1795841637540-asjk",
+            appName = "小米浏览器",
+            packageName = "com.android.browser",
+            enabled = true,
+            passiveWakeEnabled = true,
+            passiveTrigger = PassiveTriggerType.MEDIASTORE_TRIGGER,
+            channel = ChannelMode.PUBLIC_OBSERVER,
+            action = RouteAction.PROMPT,
+            sourcePaths = listOf("/storage/emulated/0/Download/MiBrowser/"),
+            defaultTargetDir = "/storage/emulated/0/Download/浏览器整理/",
+            renamePattern = "{name}",
+            subRules = listOf(
+
+            ),
+            cleanupStrategy = "keep",
+            cleanupDelayDays = 7
+        ),
+        AppRouteRule(
+            id = "rule-scan-1795841637540-s3x0",
+            appName = "WPS Office",
+            packageName = "cn.wps.moffice_eng",
+            enabled = true,
+            passiveWakeEnabled = true,
+            passiveTrigger = PassiveTriggerType.MEDIASTORE_TRIGGER,
+            channel = ChannelMode.PUBLIC_OBSERVER,
+            action = RouteAction.PROMPT,
+            sourcePaths = listOf("/storage/emulated/0/Documents/WPS/"),
+            defaultTargetDir = "/storage/emulated/0/Documents/办公文档/",
+            renamePattern = "{name}",
+            subRules = listOf(
+
+            ),
+            cleanupStrategy = "keep",
+            cleanupDelayDays = 7
+        ),
+        AppRouteRule(
+            id = "rule-scan-1795841637540-qgee",
+            appName = "Telegram",
+            packageName = "org.telegram.messenger",
+            enabled = true,
+            passiveWakeEnabled = true,
+            passiveTrigger = PassiveTriggerType.MEDIASTORE_TRIGGER,
+            channel = ChannelMode.PUBLIC_OBSERVER,
+            action = RouteAction.PROMPT,
+            sourcePaths = listOf("/storage/emulated/0/Download/Telegram/"),
+            defaultTargetDir = "/storage/emulated/0/Documents/Telegram归档/",
+            renamePattern = "{name}",
+            subRules = listOf(
+
+            ),
+            cleanupStrategy = "keep",
+            cleanupDelayDays = 7
+        ),
+        AppRouteRule(
             id = "rule-wechat",
             appName = "微信",
             packageName = "com.tencent.mm",
@@ -101,7 +177,7 @@ object DefaultRuleRepository {
             passiveTrigger = PassiveTriggerType.MEDIASTORE_TRIGGER,
             channel = ChannelMode.PUBLIC_OBSERVER,
             action = RouteAction.PROMPT,
-            sourcePaths = listOf("/storage/emulated/0/Download/WeiXin/", "/storage/emulated/0/Pictures/WeiXin/"),
+            sourcePaths = listOf("/storage/emulated/0/Pictures/WeiXin/", "/storage/emulated/0/Documents/WeChat/", "/storage/emulated/0/Movies/WeiXin/"),
             defaultTargetDir = "/storage/emulated/0/Documents/微信归档/",
             renamePattern = "{date}_{name}",
             subRules = listOf(
@@ -114,7 +190,9 @@ object DefaultRuleRepository {
                 ExtensionSubRule("音频与录音", listOf("mp3", "wav", "flac", "m4a", "aac", "ogg"), "/storage/emulated/0/Music/"),
                 ExtensionSubRule("安卓安装包", listOf("apk.1"), "/storage/emulated/0/Download/安装包/"),
                 ExtensionSubRule("压缩归档包", listOf("tar", "gz"), "/storage/emulated/0/Download/压缩包/")
-            )
+            ),
+            cleanupStrategy = "keep",
+            cleanupDelayDays = 7
         ),
         AppRouteRule(
             id = "rule-qq-share",
@@ -122,7 +200,7 @@ object DefaultRuleRepository {
             packageName = "com.tencent.mobileqq",
             enabled = true,
             passiveWakeEnabled = true,
-            passiveTrigger = PassiveTriggerType.MEDIASTORE_TRIGGER,
+            passiveTrigger = PassiveTriggerType.INTENT_FILTER,
             channel = ChannelMode.SHARE_INTENT,
             action = RouteAction.PROMPT,
             sourcePaths = listOf("content://com.tencent.mobileqq.fileprovider/QQfile_recv/"),
@@ -131,8 +209,16 @@ object DefaultRuleRepository {
             subRules = listOf(
                 ExtensionSubRule("课件与学习资料", listOf("pdf", "docx", "pptx", "epub", "txt"), "/storage/emulated/0/Documents/学习资料/"),
                 ExtensionSubRule("群文件安装包", listOf("apk", "apk.1"), "/storage/emulated/0/Download/安装包/"),
-                ExtensionSubRule("群压缩包", listOf("zip", "rar", "7z"), "/storage/emulated/0/Download/压缩包/")
-            )
+                ExtensionSubRule("群压缩包", listOf("zip", "rar", "7z"), "/storage/emulated/0/Download/压缩包/"),
+                ExtensionSubRule("图片与相册", listOf("jpg", "jpeg", "png", "webp", "gif", "heic", "bmp"), "/storage/emulated/0/Pictures/"),
+                ExtensionSubRule("文档与表格", listOf("doc", "xls", "xlsx", "ppt", "md", "csv"), "/storage/emulated/0/Documents/"),
+                ExtensionSubRule("视频影像", listOf("mp4", "mov", "mkv", "avi", "webm", "m4v"), "/storage/emulated/0/Movies/"),
+                ExtensionSubRule("音频与录音", listOf("mp3", "wav", "flac", "m4a", "aac", "ogg"), "/storage/emulated/0/Music/"),
+                ExtensionSubRule("安卓安装包", listOf("apks", "xapk"), "/storage/emulated/0/Download/安装包/"),
+                ExtensionSubRule("压缩归档包", listOf("tar", "gz"), "/storage/emulated/0/Download/压缩包/")
+            ),
+            cleanupStrategy = "keep",
+            cleanupDelayDays = 7
         ),
         AppRouteRule(
             id = "rule-qq-public",
@@ -143,12 +229,20 @@ object DefaultRuleRepository {
             passiveTrigger = PassiveTriggerType.MEDIASTORE_TRIGGER,
             channel = ChannelMode.PUBLIC_OBSERVER,
             action = RouteAction.PROMPT,
-            sourcePaths = listOf("/storage/emulated/0/Download/QQ/", "/storage/emulated/0/Pictures/QQ/"),
+            sourcePaths = listOf("/storage/emulated/0/Download/QQ/", "/storage/emulated/0/Pictures/QQ/", "/storage/emulated/0/Documents/Tencent/QQfile_recv/"),
             defaultTargetDir = "/storage/emulated/0/Documents/QQ归档/",
             renamePattern = "{name}",
             subRules = listOf(
-                ExtensionSubRule("QQ 保存的图片视频", listOf("jpg", "jpeg", "png", "mp4", "mov"), "/storage/emulated/0/Pictures/社交归档/")
-            )
+                ExtensionSubRule("QQ 保存的图片视频", listOf("jpg", "jpeg", "png", "mp4", "mov"), "/storage/emulated/0/Pictures/社交归档/"),
+                ExtensionSubRule("图片与相册", listOf("webp", "gif", "heic", "bmp"), "/storage/emulated/0/Pictures/"),
+                ExtensionSubRule("文档与表格", listOf("pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "txt", "md", "csv", "epub"), "/storage/emulated/0/Documents/"),
+                ExtensionSubRule("视频影像", listOf("mkv", "avi", "webm", "m4v"), "/storage/emulated/0/Movies/"),
+                ExtensionSubRule("音频与录音", listOf("mp3", "wav", "flac", "m4a", "aac", "ogg"), "/storage/emulated/0/Music/"),
+                ExtensionSubRule("安卓安装包", listOf("apk", "apks", "xapk", "apk.1"), "/storage/emulated/0/Download/安装包/"),
+                ExtensionSubRule("压缩归档包", listOf("zip", "rar", "7z", "tar", "gz"), "/storage/emulated/0/Download/压缩包/")
+            ),
+            cleanupStrategy = "keep",
+            cleanupDelayDays = 7
         ),
         AppRouteRule(
             id = "rule-dingtalk",
@@ -163,8 +257,16 @@ object DefaultRuleRepository {
             defaultTargetDir = "/storage/emulated/0/Documents/办公文档/",
             renamePattern = "{date}_{name}",
             subRules = listOf(
-                ExtensionSubRule("报表与电子发票", listOf("xlsx", "xls", "csv", "pdf"), "/storage/emulated/0/Documents/财务票据/")
-            )
+                ExtensionSubRule("报表与电子发票", listOf("xlsx", "xls", "csv", "pdf"), "/storage/emulated/0/Documents/财务票据/"),
+                ExtensionSubRule("图片与相册", listOf("jpg", "jpeg", "png", "webp", "gif", "heic", "bmp"), "/storage/emulated/0/Pictures/"),
+                ExtensionSubRule("文档与表格", listOf("doc", "docx", "ppt", "pptx", "txt", "md", "epub"), "/storage/emulated/0/Documents/"),
+                ExtensionSubRule("视频影像", listOf("mp4", "mov", "mkv", "avi", "webm", "m4v"), "/storage/emulated/0/Movies/"),
+                ExtensionSubRule("音频与录音", listOf("mp3", "wav", "flac", "m4a", "aac", "ogg"), "/storage/emulated/0/Music/"),
+                ExtensionSubRule("安卓安装包", listOf("apk", "apks", "xapk", "apk.1"), "/storage/emulated/0/Download/安装包/"),
+                ExtensionSubRule("压缩归档包", listOf("zip", "rar", "7z", "tar", "gz"), "/storage/emulated/0/Download/压缩包/")
+            ),
+            cleanupStrategy = "keep",
+            cleanupDelayDays = 7
         ),
         AppRouteRule(
             id = "rule-feishu",
@@ -179,8 +281,16 @@ object DefaultRuleRepository {
             defaultTargetDir = "/storage/emulated/0/Documents/办公文档/",
             renamePattern = "{name}",
             subRules = listOf(
-                ExtensionSubRule("演示与方案材料", listOf("pptx", "key", "pdf"), "/storage/emulated/0/Documents/办公文档/")
-            )
+                ExtensionSubRule("演示与方案材料", listOf("pptx", "key", "pdf"), "/storage/emulated/0/Documents/办公文档/"),
+                ExtensionSubRule("图片与相册", listOf("jpg", "jpeg", "png", "webp", "gif", "heic", "bmp"), "/storage/emulated/0/Pictures/"),
+                ExtensionSubRule("文档与表格", listOf("doc", "docx", "xls", "xlsx", "ppt", "txt", "md", "csv", "epub"), "/storage/emulated/0/Documents/"),
+                ExtensionSubRule("视频影像", listOf("mp4", "mov", "mkv", "avi", "webm", "m4v"), "/storage/emulated/0/Movies/"),
+                ExtensionSubRule("音频与录音", listOf("mp3", "wav", "flac", "m4a", "aac", "ogg"), "/storage/emulated/0/Music/"),
+                ExtensionSubRule("安卓安装包", listOf("apk", "apks", "xapk", "apk.1"), "/storage/emulated/0/Download/安装包/"),
+                ExtensionSubRule("压缩归档包", listOf("zip", "rar", "7z", "tar", "gz"), "/storage/emulated/0/Download/压缩包/")
+            ),
+            cleanupStrategy = "keep",
+            cleanupDelayDays = 7
         ),
         AppRouteRule(
             id = "rule-tim",
@@ -195,8 +305,15 @@ object DefaultRuleRepository {
             defaultTargetDir = "/storage/emulated/0/Documents/办公文档/",
             renamePattern = "{name}",
             subRules = listOf(
-
-            )
+                ExtensionSubRule("图片与相册", listOf("jpg", "jpeg", "png", "webp", "gif", "heic", "bmp"), "/storage/emulated/0/Pictures/"),
+                ExtensionSubRule("文档与表格", listOf("pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "txt", "md", "csv", "epub"), "/storage/emulated/0/Documents/"),
+                ExtensionSubRule("视频影像", listOf("mp4", "mov", "mkv", "avi", "webm", "m4v"), "/storage/emulated/0/Movies/"),
+                ExtensionSubRule("音频与录音", listOf("mp3", "wav", "flac", "m4a", "aac", "ogg"), "/storage/emulated/0/Music/"),
+                ExtensionSubRule("安卓安装包", listOf("apk", "apks", "xapk", "apk.1"), "/storage/emulated/0/Download/安装包/"),
+                ExtensionSubRule("压缩归档包", listOf("zip", "rar", "7z", "tar", "gz"), "/storage/emulated/0/Download/压缩包/")
+            ),
+            cleanupStrategy = "keep",
+            cleanupDelayDays = 7
         ),
         AppRouteRule(
             id = "rule-quark",
@@ -207,19 +324,28 @@ object DefaultRuleRepository {
             passiveTrigger = PassiveTriggerType.MEDIASTORE_TRIGGER,
             channel = ChannelMode.PUBLIC_OBSERVER,
             action = RouteAction.PROMPT,
-            sourcePaths = listOf("/storage/emulated/0/Quark/Download/", "/storage/emulated/0/Download/"),
+            sourcePaths = listOf("/storage/emulated/0/QuarkDownloads/", "/storage/emulated/0/Download/"),
             defaultTargetDir = "/storage/emulated/0/Download/浏览器整理/",
             renamePattern = "{name}",
             subRules = listOf(
-                ExtensionSubRule("网页下载安装包", listOf("apk"), "/storage/emulated/0/Download/安装包/")
-            )
+                ExtensionSubRule("网页下载安装包", listOf("apk"), "/storage/emulated/0/Download/安装包/"),
+                ExtensionSubRule("图片与相册", listOf("jpg", "jpeg", "png", "webp", "gif", "heic", "bmp"), "/storage/emulated/0/Pictures/"),
+                ExtensionSubRule("文档与表格", listOf("pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "txt", "md", "csv", "epub"), "/storage/emulated/0/Documents/"),
+                ExtensionSubRule("视频影像", listOf("mp4", "mov", "mkv", "avi", "webm", "m4v"), "/storage/emulated/0/Movies/"),
+                ExtensionSubRule("音频与录音", listOf("mp3", "wav", "flac", "m4a", "aac", "ogg"), "/storage/emulated/0/Music/"),
+                ExtensionSubRule("安卓安装包", listOf("apks", "xapk", "apk.1"), "/storage/emulated/0/Download/安装包/"),
+                ExtensionSubRule("压缩归档包", listOf("zip", "rar", "7z", "tar", "gz"), "/storage/emulated/0/Download/压缩包/")
+            ),
+            cleanupStrategy = "keep",
+            cleanupDelayDays = 7
         )
     )
 
     fun resolveTargetDir(
         rule: AppRouteRule?,
         fileName: String,
-        smartClassifyEnabled: Boolean
+        smartClassifyEnabled: Boolean,
+        smartGroupByApp: Boolean = false
     ): Pair<String, String?> {
         val lower = fileName.lowercase(Locale.ROOT)
         val ext = if (lower.endsWith(".apk.1")) "apk.1" else lower.substringAfterLast('.', "")
@@ -238,7 +364,13 @@ object DefaultRuleRepository {
                 tpl.extensions.any { it.equals(ext, ignoreCase = true) }
             }
             if (smart != null) {
-                return ensureTrailingSlash(smart.targetDir) to "智能归类·${smart.label}"
+                val cleanApp = rule?.appName?.replace(Regex("（.*?）"), "")?.trim().orEmpty()
+                val dir = if (smartGroupByApp && cleanApp.isNotBlank()) {
+                    "${ensureTrailingSlash(smart.targetDir)}$cleanApp/"
+                } else {
+                    ensureTrailingSlash(smart.targetDir)
+                }
+                return dir to "智能后缀·${smart.label}"
             }
         }
 
@@ -253,7 +385,18 @@ object DefaultRuleRepository {
     ): AppRouteRule? {
         val activeRules = rules.filter { it.enabled && it.action != RouteAction.IGNORE }
 
-        // 1. 优先匹配系统 MediaStore 返回的写入来源包名（Android 10–17 最精准，不受目录差异影响）
+        // 1. 严格按用户定义的规则顺序匹配路径前缀（越靠前优先级越高，多规则重叠同一路径时优先生效）
+        val normalized = absolutePath.lowercase(Locale.ROOT)
+        activeRules
+            .filter { it.channel == ChannelMode.PUBLIC_OBSERVER }
+            .firstOrNull { r ->
+                r.sourcePaths.any { src ->
+                    val cleanSrc = src.trimEnd('/').lowercase(Locale.ROOT)
+                    cleanSrc.isNotBlank() && normalized.startsWith(cleanSrc)
+                }
+            }?.let { return it }
+
+        // 2. 路径未直接命中时，按系统 MediaStore 写入来源包名依优先级匹配规则
         if (!ownerPackage.isNullOrBlank()) {
             activeRules.firstOrNull {
                 it.packageName.equals(ownerPackage, ignoreCase = true) && it.channel == ChannelMode.PUBLIC_OBSERVER
@@ -262,18 +405,6 @@ object DefaultRuleRepository {
                 it.packageName.equals(ownerPackage, ignoreCase = true)
             }?.let { return it }
         }
-
-        // 2. 精确前缀匹配规则配置的目录
-        val normalized = absolutePath.lowercase(Locale.ROOT)
-        activeRules
-            .filter { it.channel == ChannelMode.PUBLIC_OBSERVER }
-            .sortedByDescending { r -> r.sourcePaths.maxOfOrNull { it.length } ?: 0 }
-            .firstOrNull { r ->
-                r.sourcePaths.any { src ->
-                    val cleanSrc = src.trimEnd('/').lowercase(Locale.ROOT)
-                    cleanSrc.isNotBlank() && normalized.startsWith(cleanSrc)
-                }
-            }?.let { return it }
 
         // 3. 关键字模糊匹配（适配不同手机 ROM 的微信/QQ/钉钉/飞书目录变体）
         return when {
@@ -297,15 +428,67 @@ object DefaultRuleRepository {
         val pkg = ownerPackage?.lowercase(Locale.ROOT).orEmpty()
         val p = absolutePath.lowercase(Locale.ROOT)
         return when {
-            pkg.contains("tencent.mm") || p.contains("weixin") || p.contains("micromsg") -> "微信"
-            pkg.contains("mobileqq") || p.contains("/qq/") || p.contains("qqfile") -> "QQ"
-            pkg.contains("tencent.tim") || p.contains("timfile") -> "TIM"
+            pkg.contains("tencent.mm") || p.contains("weixin") || p.contains("micromsg") || p.contains("wechat") -> "微信"
+            pkg.contains("mobileqq") || p.contains("/qq/") || p.endsWith("/qq") || p.contains("qqfile") -> "QQ"
+            pkg.contains("tencent.tim") || p.contains("timfile") || p.contains("/tim/") -> "TIM"
             pkg.contains("rimet") || p.contains("dingtalk") -> "钉钉"
-            pkg.contains("lark") || p.contains("feishu") -> "飞书"
-            pkg.contains("quark") || p.contains("quark") -> "夸克浏览器"
-            pkg.contains("chrome") || pkg.contains("browser") -> "手机浏览器"
-            else -> "新下载文件"
+            pkg.contains("lark") || p.contains("feishu") || p.contains("飞书") -> "飞书"
+            pkg.contains("quark") || p.contains("quark") || p.contains("夸克") -> "夸克浏览器"
+            pkg.contains("ucmobile") || p.contains("ucdownload") -> "UC 浏览器"
+            pkg.contains("baidu") || p.contains("baidunetdisk") -> "百度网盘"
+            pkg.contains("telegram") -> "Telegram"
+            pkg.contains("wps") || p.contains("kingsoft") -> "WPS 文档"
+            pkg.contains("chrome") || pkg.contains("browser") || p.contains("mibrowser") -> "手机浏览器"
+            else -> "本机目录"
         }
+    }
+
+    fun resolveRuleIdForDiscoveredDir(
+        rules: List<AppRouteRule>,
+        dirPath: String,
+        ownerPackages: List<String>
+    ): Pair<String?, String> {
+        val lowerPath = dirPath.lowercase(Locale.ROOT)
+        val lowerPkgs = ownerPackages.map { it.lowercase(Locale.ROOT) }
+
+        // 1. 优先用系统 MediaStore 记录的真实写入包名精准匹配规则
+        for (pkg in lowerPkgs) {
+            val hit = rules.firstOrNull {
+                it.packageName.equals(pkg, ignoreCase = true) && it.channel == ChannelMode.PUBLIC_OBSERVER
+            } ?: rules.firstOrNull { it.packageName.equals(pkg, ignoreCase = true) }
+            if (hit != null) return hit.id to hit.appName
+        }
+
+        // 2. 路径关键字智能归属（适配不同厂商 ROM 与多版本目录名）
+        val ruleByKeyword: AppRouteRule? = when {
+            lowerPath.contains("weixin") || lowerPath.contains("wechat") || lowerPath.contains("micromsg") ->
+                rules.firstOrNull { it.packageName == "com.tencent.mm" }
+            lowerPath.contains("/qq") || lowerPath.contains("qqfile_recv") || lowerPath.contains("mobileqq") ->
+                rules.firstOrNull { it.packageName == "com.tencent.mobileqq" && it.channel == ChannelMode.PUBLIC_OBSERVER }
+                    ?: rules.firstOrNull { it.packageName == "com.tencent.mobileqq" }
+            lowerPath.contains("/tim") || lowerPath.contains("timfile") ->
+                rules.firstOrNull { it.packageName == "com.tencent.tim" }
+            lowerPath.contains("dingtalk") ->
+                rules.firstOrNull { it.packageName == "com.alibaba.android.rimet" }
+            lowerPath.contains("lark") || lowerPath.contains("feishu") || lowerPath.contains("飞书") ->
+                rules.firstOrNull { it.packageName == "com.ss.android.lark" }
+            lowerPath.contains("quark") || lowerPath.contains("夸克") || lowerPath.contains("browser") || lowerPath.contains("chrome") || lowerPath.contains("ucdownload") ->
+                rules.firstOrNull { it.id == "rule-quark" || it.packageName.contains("quark") || it.packageName.contains("browser") }
+            else -> null
+        }
+
+        if (ruleByKeyword != null) {
+            return ruleByKeyword.id to ruleByKeyword.appName
+        }
+
+        val fallbackName = inferAppLabel(dirPath, ownerPackages.firstOrNull(), null).let { inferred ->
+            if (inferred == "本机目录") {
+                dirPath.trimEnd('/').substringAfterLast('/').ifBlank { "自定义目录" }
+            } else {
+                inferred
+            }
+        }
+        return null to fallbackName
     }
 
     fun ensureTrailingSlash(path: String): String {

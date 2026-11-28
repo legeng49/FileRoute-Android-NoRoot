@@ -9,9 +9,14 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
+import android.os.VibrationAttributes
+import android.os.VibrationEffect
+import android.os.Vibrator
+import android.os.VibratorManager
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import app.fileroute.service.DownloadMonitorService
+import app.fileroute.ui.OpenSourceFolderActivity
 import app.fileroute.ui.ShareReceiverActivity
 import java.io.File
 
@@ -87,13 +92,25 @@ object NotificationHelper {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
+        val sourceDirPath = file.parent ?: "/storage/emulated/0/Download"
+        val openFolderIntent = Intent(context, OpenSourceFolderActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_NO_HISTORY
+            putExtra(DownloadMonitorService.EXTRA_SOURCE_PATH, sourceDirPath)
+        }
+        val openFolderPi = PendingIntent.getActivity(
+            context,
+            (file.absolutePath + "#open_folder").hashCode(),
+            openFolderIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
         val notification = NotificationCompat.Builder(context, CHANNEL_ALERT)
             .setSmallIcon(android.R.drawable.stat_sys_download_done)
             .setContentTitle("检测到 $appName 新下载文件")
             .setContentText("${file.name} · 点击选择目标目录归位")
             .setStyle(
                 NotificationCompat.BigTextStyle()
-                    .bigText("${file.name}\n建议归位 → $suggestedDir")
+                    .bigText("${file.name}\n源目录：${sourceDirPath}\n建议归位 → $suggestedDir")
             )
             .setPriority(NotificationCompat.PRIORITY_HIGH)
             .setCategory(NotificationCompat.CATEGORY_MESSAGE)
@@ -101,6 +118,7 @@ object NotificationHelper {
             .setAutoCancel(true)
             .setContentIntent(pi)
             .addAction(0, "选择目录归位", pi)
+            .addAction(0, "打开源文件夹", openFolderPi)
             .build()
 
         val nm = context.getSystemService(NotificationManager::class.java) ?: return false
@@ -122,5 +140,36 @@ object NotificationHelper {
             .build()
         context.getSystemService(NotificationManager::class.java)?.notify(99001, notification)
         return true
+    }
+
+    /**
+     * 文件归位确认成功后的轻微双振反馈：
+     * 使用 VibrationAttributes.USAGE_NOTIFICATION，保证熄屏状态下同样可轻微震动确认。
+     */
+    fun vibrateOnArchiveSuccess(context: Context) {
+        runCatching {
+            val vibrator: Vibrator? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                val vm = context.getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as? VibratorManager
+                vm?.defaultVibrator
+            } else {
+                @Suppress("DEPRECATION")
+                context.getSystemService(Context.VIBRATOR_SERVICE) as? Vibrator
+            }
+            if (vibrator == null || !vibrator.hasVibrator()) return
+
+            val effect = VibrationEffect.createWaveform(
+                longArrayOf(0L, 20L, 40L, 28L),
+                intArrayOf(0, 96, 0, 148),
+                -1
+            )
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                val attrs = VibrationAttributes.Builder()
+                    .setUsage(VibrationAttributes.USAGE_NOTIFICATION)
+                    .build()
+                vibrator.vibrate(effect, attrs)
+            } else {
+                vibrator.vibrate(effect)
+            }
+        }
     }
 }

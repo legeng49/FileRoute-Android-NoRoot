@@ -30,11 +30,26 @@ import java.util.concurrent.Executors
 class DownloadMonitorService : Service() {
 
     companion object {
+        const val ACTION_RELOAD_WATCHERS = "app.fileroute.action.RELOAD_WATCHERS"
         const val EXTRA_SOURCE_PATH = "extra_source_path"
         const val EXTRA_APP_NAME = "extra_app_name"
         const val EXTRA_SUGGESTED_DIR = "extra_suggested_dir"
-        const val POWER_MODE = "HIGH_PERFORMANCE"
-        const val EVENT_DEBOUNCE_MS = 400L
+        const val POWER_MODE = "EVENT_TRIGGERED_WORKMANAGER"
+        const val EVENT_DEBOUNCE_MS = 900L
+
+        fun reloadIfRunning(context: android.content.Context) {
+            if (!RuntimeStateStore.guardArmed || RuntimeStateStore.useEventTriggeredMode) return
+            val intent = Intent(context.applicationContext, DownloadMonitorService::class.java).apply {
+                action = ACTION_RELOAD_WATCHERS
+            }
+            runCatching {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    context.applicationContext.startForegroundService(intent)
+                } else {
+                    context.applicationContext.startService(intent)
+                }
+            }
+        }
     }
 
     private val observers = mutableListOf<FileObserver>()
@@ -69,6 +84,10 @@ class DownloadMonitorService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (intent?.action == ACTION_RELOAD_WATCHERS) {
+            startDirectoryAndMediaWatchers()
+            RuntimeStateStore.appendLog("规则校准后已热重载监听目录（当前 ${observers.size} 个目录 + MediaStore）")
+        }
         scheduleDebouncedScan()
         return START_STICKY
     }
@@ -81,19 +100,24 @@ class DownloadMonitorService : Service() {
     private fun startDirectoryAndMediaWatchers() {
         observers.forEach { it.stopWatching() }
         observers.clear()
+        mediaObserver?.let { runCatching { contentResolver.unregisterContentObserver(it) } }
+        mediaObserver = null
 
         val watchDirs = linkedSetOf<File>()
         val extRoot = Environment.getExternalStorageDirectory()
-        val downloadRoot = File(extRoot, "Download")
-        if (downloadRoot.exists() && downloadRoot.isDirectory) {
-            watchDirs.add(downloadRoot)
-            downloadRoot.listFiles()?.filter { it.isDirectory && !it.name.startsWith(".") }?.forEach {
-                watchDirs.add(it)
+        listOf("Download", "Downloads", "Documents").forEach { topName ->
+            val root = File(extRoot, topName)
+            if (root.exists() && root.isDirectory) {
+                watchDirs.add(root)
+                root.listFiles()?.filter { it.isDirectory && !it.name.startsWith(".") }?.take(20)?.forEach {
+                    watchDirs.add(it)
+                }
             }
         }
         watchDirs.add(File(extRoot, "Pictures/WeiXin"))
         watchDirs.add(File(extRoot, "Pictures/QQ"))
-        watchDirs.add(File(extRoot, "Documents/WeiXin"))
+        watchDirs.add(File(extRoot, "Movies/WeiXin"))
+        watchDirs.add(File(extRoot, "Movies/QQ"))
 
         RuntimeStateStore.rules
             .filter { it.enabled && it.channel == ChannelMode.PUBLIC_OBSERVER && it.action != RouteAction.IGNORE }

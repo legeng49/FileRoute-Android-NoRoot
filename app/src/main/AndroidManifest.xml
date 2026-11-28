@@ -15,6 +15,8 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+    <uses-permission android:name="android.permission.VIBRATE" />
+    <uses-permission android:name="android.permission.INTERNET" />
 
     <supports-screens
         android:smallScreens="true"
@@ -74,6 +76,13 @@
                 <data android:mimeType="*/*" />
             </intent-filter>
         </activity>
+
+        <!-- 顶部通知「打开源文件夹」快捷跳转：使用 Activity PendingIntent 合规调起系统文件管理器 -->
+        <activity
+            android:name=".ui.OpenSourceFolderActivity"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:theme="@android:style/Theme.NoDisplay" />
 
         <!-- 公共目录 + MediaStore 实时检测前台服务 -->
         <service

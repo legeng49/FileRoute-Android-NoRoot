@@ -63,7 +63,8 @@ class ShareReceiverActivity : ComponentActivity() {
         val autoTarget = DefaultRuleRepository.resolveTargetDir(
             rule = null,
             fileName = primaryName,
-            smartClassifyEnabled = RuntimeStateStore.smartClassifyEnabled
+            smartClassifyEnabled = RuntimeStateStore.smartClassifyEnabled,
+            smartGroupByApp = RuntimeStateStore.smartGroupByApp
         ).first
         val initialSuggested = intent.getStringExtra(DownloadMonitorService.EXTRA_SUGGESTED_DIR)
             ?: autoTarget
@@ -72,6 +73,24 @@ class ShareReceiverActivity : ComponentActivity() {
             MaterialTheme {
                 var selectedDir by remember { mutableStateOf(initialSuggested) }
                 var copyOnly by remember { mutableStateOf(sharedUris.isNotEmpty()) }
+                var conflictStrategy by remember { mutableStateOf("rename_timestamp") }
+                val existingConflict = remember(selectedDir, primaryName) {
+                    DownloadDiscoveryEngine.findExistingConflict(selectedDir, primaryName)
+                }
+                val isExactDuplicate = remember(
+                    selectedDir,
+                    primaryName,
+                    RuntimeStateStore.integrityCheckEnabled
+                ) {
+                    if (existingConflict != null && RuntimeStateStore.integrityCheckEnabled && directFilePath != null) {
+                        DownloadDiscoveryEngine.isIdenticalFile(File(directFilePath), existingConflict)
+                    } else {
+                        false
+                    }
+                }
+                val timestampPreviewName = remember(selectedDir, primaryName) {
+                    DownloadDiscoveryEngine.buildTimestampedFileName(primaryName)
+                }
 
                 ModalBottomSheet(onDismissRequest = { finish() }) {
                     Column(
@@ -95,6 +114,75 @@ class ShareReceiverActivity : ComponentActivity() {
                             singleLine = true
                         )
 
+                        if (isExactDuplicate && existingConflict != null) {
+                            Surface(
+                                color = androidx.compose.ui.graphics.Color(0xFFF0FDFA),
+                                shape = androidx.compose.foundation.shape.RoundedCornerShape(12.dp),
+                                border = androidx.compose.foundation.BorderStroke(
+                                    1.dp,
+                                    androidx.compose.ui.graphics.Color(0xFF99F6E4)
+                                )
+                            ) {
+                                Column(
+                                    modifier = Modifier.fillMaxWidth().padding(12.dp),
+                                    verticalArrangement = Arrangement.spacedBy(4.dp)
+                                ) {
+                                    Text(
+                                        "完整性校验一致（大小与 SHA-256 相同）",
+                                        style = MaterialTheme.typography.labelLarge,
+                                        color = androidx.compose.ui.graphics.Color(0xFF0F766E)
+                                    )
+                                    Text(
+                                        "目标目录已存在完全相同的文件，确认后将自动跳过归位，避免无效写入与空间浪费。",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
+                            }
+                        } else if (existingConflict != null) {
+                            Surface(
+                                color = androidx.compose.ui.graphics.Color(0xFFFFFBEB),
+                                shape = androidx.compose.foundation.shape.RoundedCornerShape(12.dp),
+                                border = androidx.compose.foundation.BorderStroke(
+                                    1.dp,
+                                    androidx.compose.ui.graphics.Color(0xFFFDE68A)
+                                )
+                            ) {
+                                Column(
+                                    modifier = Modifier.fillMaxWidth().padding(12.dp),
+                                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                                ) {
+                                    Text(
+                                        "目标目录已存在同名文件（${DefaultRuleRepository.formatSize(existingConflict.length())}）",
+                                        style = MaterialTheme.typography.labelLarge,
+                                        color = androidx.compose.ui.graphics.Color(0xFF92400E)
+                                    )
+                                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                        listOf(
+                                            "rename_timestamp" to "重命名(时间戳)",
+                                            "overwrite" to "覆盖",
+                                            "skip" to "跳过"
+                                        ).forEach { (key, lbl) ->
+                                            FilterChip(
+                                                selected = conflictStrategy == key,
+                                                onClick = { conflictStrategy = key },
+                                                label = { Text(lbl) }
+                                            )
+                                        }
+                                    }
+                                    Text(
+                                        when (conflictStrategy) {
+                                            "rename_timestamp" -> "将保存为：$timestampPreviewName"
+                                            "overwrite" -> "将覆盖目标目录中的已有同名文件"
+                                            else -> "将跳过此文件，原目录与目标文件均保持不变"
+                                        },
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
+                            }
+                        }
+
                         LazyVerticalGrid(
                             columns = GridCells.Fixed(2),
                             horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -111,6 +199,19 @@ class ShareReceiverActivity : ComponentActivity() {
                             }
                         }
 
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Text("文件完整性校验（一致自动跳过）")
+                            Switch(
+                                checked = RuntimeStateStore.integrityCheckEnabled,
+                                onCheckedChange = {
+                                    RuntimeStateStore.updateSettings(context = applicationContext, integrityCheck = it)
+                                }
+                            )
+                        }
+
                         if (directFilePath != null) {
                             Row(
                                 modifier = Modifier.fillMaxWidth(),
@@ -123,6 +224,7 @@ class ShareReceiverActivity : ComponentActivity() {
 
                         Button(
                             onClick = {
+                                val strategy = if (existingConflict != null) conflictStrategy else "rename_timestamp"
                                 val ok = if (directFilePath != null) {
                                     DownloadDiscoveryEngine.relocateFile(
                                         context = applicationContext,
@@ -131,7 +233,8 @@ class ShareReceiverActivity : ComponentActivity() {
                                         appName = sourceApp,
                                         fileName = primaryName,
                                         targetDirPath = selectedDir,
-                                        copyOnly = copyOnly
+                                        copyOnly = copyOnly,
+                                        conflictStrategy = strategy
                                     )
                                 } else if (sharedUris.isNotEmpty()) {
                                     sharedUris.all { uri ->
@@ -142,7 +245,8 @@ class ShareReceiverActivity : ComponentActivity() {
                                             appName = sourceApp,
                                             fileName = resolveDisplayName(uri),
                                             targetDirPath = selectedDir,
-                                            copyOnly = true
+                                            copyOnly = true,
+                                            conflictStrategy = strategy
                                         )
                                     }
                                 } else {
@@ -150,7 +254,13 @@ class ShareReceiverActivity : ComponentActivity() {
                                 }
                                 Toast.makeText(
                                     this@ShareReceiverActivity,
-                                    if (ok) "已归位至 $selectedDir" else "保存失败，请先在首页授予所有文件访问权限",
+                                    when {
+                                        !ok -> "保存失败，请先在首页授予所有文件访问权限"
+                                        existingConflict != null && strategy == "skip" -> "已跳过同名文件"
+                                        existingConflict != null && strategy == "overwrite" -> "已覆盖同名文件并归位至 $selectedDir"
+                                        existingConflict != null -> "已添加时间戳归位至 $selectedDir"
+                                        else -> "已归位至 $selectedDir"
+                                    },
                                     Toast.LENGTH_SHORT
                                 ).show()
                                 finish()
@@ -159,7 +269,15 @@ class ShareReceiverActivity : ComponentActivity() {
                                 .fillMaxWidth()
                                 .height(48.dp)
                         ) {
-                            Text(if (copyOnly) "确认复制到此目录" else "确认移动归位")
+                            Text(
+                                when {
+                                    existingConflict != null && conflictStrategy == "skip" -> "确认跳过此文件"
+                                    existingConflict != null && conflictStrategy == "overwrite" -> "覆盖原文件并归位"
+                                    existingConflict != null -> "添加时间戳并归位"
+                                    copyOnly -> "确认复制到此目录"
+                                    else -> "确认移动归位"
+                                }
+                            )
                         }
 
                         Spacer(modifier = Modifier.height(16.dp))

@@ -43,34 +43,34 @@ jobs:
         run: gradle assembleDebug
 
       - name: Rename APK
-        run: mv app/build/outputs/apk/debug/app-debug.apk FileRoute-v2.1.0-android17-debug.apk
+        run: mv app/build/outputs/apk/debug/app-debug.apk FileRoute-v3.0.0-android17-debug.apk
 
       - name: Upload APK Artifact
         uses: actions/upload-artifact@v4
         with:
           name: FileRoute-android17-debug-apk
-          path: FileRoute-v2.1.0-android17-debug.apk
+          path: FileRoute-v3.0.0-android17-debug.apk
 
       - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           notes=$(cat <<'EOF'
-          v2.1 完整实机版。修复上一版实机无反应、页面空白。
+          v3.0.0。规则增至 10 条（8 条公共目录监听 + 2 条分享归位）。
 
-          - 推送前注册高优先级通知通道
-          - 全盘扫描 MediaStore 与 Download、Pictures，不再只认固定微信/QQ 路径
-          - 首页、规则、历史撤销、路径诊断四个页面
-          - 保留圆角程序图标
+          - 通知可打开源文件夹
+          - 继续全盘扫描 MediaStore 与 Download、Pictures
+          - 首页、规则、历史撤销、路径诊断
+          - 圆角程序图标
 
-          最低系统 Android 8.0（API 26）。安装包：FileRoute-v2.1.0-android17-debug.apk
+          最低系统 Android 8.0（API 26）。安装包：FileRoute-v3.0.0-android17-debug.apk
           EOF
           )
-          if gh release view "v2.1.0-android17" >/dev/null 2>&1; then
-            gh release upload "v2.1.0-android17" "FileRoute-v2.1.0-android17-debug.apk" --clobber
+          if gh release view "v3.0.0-android17" >/dev/null 2>&1; then
+            gh release upload "v3.0.0-android17" "FileRoute-v3.0.0-android17-debug.apk" --clobber
           else
-            gh release create "v2.1.0-android17" "FileRoute-v2.1.0-android17-debug.apk" \
-              --title "归位 FileRoute v2.1.0（Android 17）" \
+            gh release create "v3.0.0-android17" "FileRoute-v3.0.0-android17-debug.apk" \
+              --title "归位 FileRoute v3.0.0（Android 17）" \
               --notes "$notes" \
               --latest
           fi

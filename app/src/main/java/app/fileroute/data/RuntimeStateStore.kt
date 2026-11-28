@@ -17,15 +17,21 @@ import java.util.Date
 import java.util.Locale
 
 object RuntimeStateStore {
-    private const val PREF_NAME = "fileroute_runtime_v21"
+    private const val PREF_NAME = "fileroute_runtime_v30"
     private const val KEY_UNIVERSAL_SCAN = "universal_scan"
     private const val KEY_SMART_CLASSIFY = "smart_classify"
+    private const val KEY_SMART_GROUP_BY_APP = "smart_group_by_app"
     private const val KEY_EVENT_TRIGGERED = "event_triggered"
+    private const val KEY_POWER_MODE = "power_mode"
+    private const val KEY_WRITE_CHECK = "require_write_check"
+    private const val KEY_COALESCE_BATCH = "coalesce_batch"
+    private const val KEY_VERIFY_DELAY_MS = "verify_delay_ms"
     private const val KEY_GUARD_ARMED = "guard_armed"
     private const val KEY_HANDLED_SET = "handled_files"
     private const val KEY_HISTORY_JSON = "history_json"
     private const val KEY_CUSTOM_RULES_JSON = "custom_rules_json"
     private const val KEY_QUICK_FOLDERS_JSON = "quick_folders_json"
+    private const val KEY_INTEGRITY_CHECK = "integrity_check_enabled"
 
     private val mainHandler = Handler(Looper.getMainLooper())
 
@@ -48,8 +54,14 @@ object RuntimeStateStore {
 
     var universalScanEnabled by mutableStateOf(true)
     var smartClassifyEnabled by mutableStateOf(true)
-    var useEventTriggeredMode by mutableStateOf(false)
+    var smartGroupByApp by mutableStateOf(false)
+    var useEventTriggeredMode by mutableStateOf(true)
+    var powerModeName by mutableStateOf("event_triggered")
+    var requireWritePermissionCheck by mutableStateOf(true)
+    var coalesceBatchDownloads by mutableStateOf(true)
+    var writeVerifyDelayMs by mutableStateOf(1500L)
     var guardArmed by mutableStateOf(false)
+    var integrityCheckEnabled by mutableStateOf(true)
 
     private val handledKeys = linkedSetOf<String>()
 
@@ -59,8 +71,14 @@ object RuntimeStateStore {
         val prefs = context.applicationContext.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
         universalScanEnabled = prefs.getBoolean(KEY_UNIVERSAL_SCAN, true)
         smartClassifyEnabled = prefs.getBoolean(KEY_SMART_CLASSIFY, true)
-        useEventTriggeredMode = prefs.getBoolean(KEY_EVENT_TRIGGERED, false)
+        smartGroupByApp = prefs.getBoolean(KEY_SMART_GROUP_BY_APP, false)
+        powerModeName = prefs.getString(KEY_POWER_MODE, "event_triggered") ?: "event_triggered"
+        useEventTriggeredMode = prefs.getBoolean(KEY_EVENT_TRIGGERED, powerModeName == "event_triggered")
+        requireWritePermissionCheck = prefs.getBoolean(KEY_WRITE_CHECK, true)
+        coalesceBatchDownloads = prefs.getBoolean(KEY_COALESCE_BATCH, true)
+        writeVerifyDelayMs = prefs.getLong(KEY_VERIFY_DELAY_MS, 1500L)
         guardArmed = prefs.getBoolean(KEY_GUARD_ARMED, false)
+        integrityCheckEnabled = prefs.getBoolean(KEY_INTEGRITY_CHECK, true)
 
         rules.clear()
         rules.addAll(DefaultRuleRepository.initialRules)
@@ -447,21 +465,269 @@ object RuntimeStateStore {
         context: Context,
         universal: Boolean = universalScanEnabled,
         smartClassify: Boolean = smartClassifyEnabled,
+        groupByApp: Boolean = smartGroupByApp,
         eventTriggered: Boolean = useEventTriggeredMode,
-        armed: Boolean = guardArmed
+        powerMode: String = powerModeName,
+        writeCheck: Boolean = requireWritePermissionCheck,
+        coalesceBatch: Boolean = coalesceBatchDownloads,
+        verifyDelayMs: Long = writeVerifyDelayMs,
+        armed: Boolean = guardArmed,
+        integrityCheck: Boolean = integrityCheckEnabled
     ) {
         ensureInit(context)
         universalScanEnabled = universal
         smartClassifyEnabled = smartClassify
+        smartGroupByApp = groupByApp
+        powerModeName = powerMode
         useEventTriggeredMode = eventTriggered
+        requireWritePermissionCheck = writeCheck
+        coalesceBatchDownloads = coalesceBatch
+        writeVerifyDelayMs = verifyDelayMs
         guardArmed = armed
+        integrityCheckEnabled = integrityCheck
         context.applicationContext.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
             .edit()
             .putBoolean(KEY_UNIVERSAL_SCAN, universal)
             .putBoolean(KEY_SMART_CLASSIFY, smartClassify)
+            .putBoolean(KEY_SMART_GROUP_BY_APP, groupByApp)
+            .putString(KEY_POWER_MODE, powerMode)
             .putBoolean(KEY_EVENT_TRIGGERED, eventTriggered)
+            .putBoolean(KEY_WRITE_CHECK, writeCheck)
+            .putBoolean(KEY_COALESCE_BATCH, coalesceBatch)
+            .putLong(KEY_VERIFY_DELAY_MS, verifyDelayMs)
             .putBoolean(KEY_GUARD_ARMED, armed)
+            .putBoolean(KEY_INTEGRITY_CHECK, integrityCheck)
             .apply()
+    }
+
+    data class PathConflictNotice(
+        val severity: String, // "shadowed" | "duplicate" | "safe"
+        val higherRuleName: String,
+        val higherRank: Int,
+        val higherPath: String,
+        val lowerRuleId: String,
+        val lowerRuleName: String,
+        val lowerRank: Int,
+        val lowerPath: String,
+        val summary: String
+    )
+
+    fun analyzePathConflicts(): List<PathConflictNotice> {
+        val enabled = rules.mapIndexedNotNull { idx, r ->
+            if (r.enabled && r.action != RouteAction.IGNORE) (idx + 1 to r) else null
+        }
+        val list = mutableListOf<PathConflictNotice>()
+        val seen = mutableSetOf<String>()
+        for (i in enabled.indices) {
+            val (rankH, higher) = enabled[i]
+            for (j in i + 1 until enabled.size) {
+                val (rankL, lower) = enabled[j]
+                for (pH in higher.sourcePaths) {
+                    val normH = DefaultRuleRepository.ensureTrailingSlash(pH).lowercase(Locale.ROOT)
+                    if (normH.isBlank()) continue
+                    for (pL in lower.sourcePaths) {
+                        val normL = DefaultRuleRepository.ensureTrailingSlash(pL).lowercase(Locale.ROOT)
+                        if (normL.isBlank()) continue
+                        if (higher.channel != lower.channel && normH != normL) continue
+                        when {
+                            normH == normL -> {
+                                val key = "dup:${higher.id}:${lower.id}:$normH"
+                                if (seen.add(key)) {
+                                    list.add(
+                                        PathConflictNotice(
+                                            severity = "duplicate",
+                                            higherRuleName = higher.appName,
+                                            higherRank = rankH,
+                                            higherPath = pH,
+                                            lowerRuleId = lower.id,
+                                            lowerRuleName = lower.appName,
+                                            lowerRank = rankL,
+                                            lowerPath = pL,
+                                            summary = "#${String.format("%02d", rankH)} ${higher.appName} 与 #${String.format("%02d", rankL)} ${lower.appName} 监听了完全相同的路径"
+                                        )
+                                    )
+                                }
+                            }
+                            higher.channel == ChannelMode.PUBLIC_OBSERVER &&
+                                lower.channel == ChannelMode.PUBLIC_OBSERVER &&
+                                normL.startsWith(normH) && normL.length > normH.length -> {
+                                val key = "sh:${higher.id}:${lower.id}:$normH:$normL"
+                                if (seen.add(key)) {
+                                    list.add(
+                                        PathConflictNotice(
+                                            severity = "shadowed",
+                                            higherRuleName = higher.appName,
+                                            higherRank = rankH,
+                                            higherPath = pH,
+                                            lowerRuleId = lower.id,
+                                            lowerRuleName = lower.appName,
+                                            lowerRank = rankL,
+                                            lowerPath = pL,
+                                            summary = "宽泛父路径拦截：#${String.format("%02d", rankH)} ${higher.appName} 会抢先截获 #${String.format("%02d", rankL)} ${lower.appName}"
+                                        )
+                                    )
+                                }
+                            }
+                            higher.channel == ChannelMode.PUBLIC_OBSERVER &&
+                                lower.channel == ChannelMode.PUBLIC_OBSERVER &&
+                                normH.startsWith(normL) && normH.length > normL.length -> {
+                                val key = "sf:${higher.id}:${lower.id}:$normH:$normL"
+                                if (seen.add(key)) {
+                                    list.add(
+                                        PathConflictNotice(
+                                            severity = "safe",
+                                            higherRuleName = higher.appName,
+                                            higherRank = rankH,
+                                            higherPath = pH,
+                                            lowerRuleId = lower.id,
+                                            lowerRuleName = lower.appName,
+                                            lowerRank = rankL,
+                                            lowerPath = pL,
+                                            summary = "父子重叠（已安全排序）：#${String.format("%02d", rankH)} ${higher.appName} 优先于 #${String.format("%02d", rankL)} ${lower.appName}"
+                                        )
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return list
+    }
+
+    fun optimizeRulePriorities(context: Context): Int {
+        ensureInit(context)
+        val movedIds = mutableSetOf<String>()
+        val maxSteps = (rules.size * rules.size).coerceAtLeast(8)
+        repeat(maxSteps) {
+            val conflict = analyzePathConflicts().firstOrNull { it.severity == "shadowed" } ?: return@repeat
+            val higherIdx = conflict.higherRank - 1
+            val lowerIdx = conflict.lowerRank - 1
+            if (higherIdx !in rules.indices || lowerIdx !in rules.indices || lowerIdx <= higherIdx) return@repeat
+            val child = rules.removeAt(lowerIdx)
+            rules.add(higherIdx, child)
+            movedIds.add(child.id)
+        }
+        if (movedIds.isNotEmpty()) {
+            saveCustomRules(context)
+            appendLog("已自动优化规则优先级，上移 ${movedIds.size} 条子目录规则以消除路径拦截")
+        }
+        return movedIds.size
+    }
+
+    /**
+     * 规则健康度一键修复：
+     * 1) 存在路径冲突时按路径深度（从深到浅）自动重排公共目录监听规则优先级；
+     * 2) 合并并去重多条规则中重复匹配的文件后缀与同目标子规则。
+     * 返回 Pair(重排规则数, 合并重复后缀数)
+     */
+    fun autoFixRuleHealthIssues(context: Context): Pair<Int, Int> {
+        ensureInit(context)
+        fun pathDepth(path: String): Int =
+            path.trim().trim('/').split('/').filter { it.isNotBlank() }.size
+
+        val beforeOrder = rules.map { it.id }
+        val conflicts = analyzePathConflicts()
+        val hasConflict = conflicts.any { it.severity == "shadowed" || it.severity == "exact_duplicate" }
+        var reorderedCount = 0
+
+        if (hasConflict) {
+            val publicSlots = mutableListOf<Int>()
+            val publicRules = mutableListOf<AppRouteRule>()
+            rules.forEachIndexed { idx, r ->
+                if (r.enabled && r.action != RouteAction.IGNORE && r.channel == ChannelMode.PUBLIC_OBSERVER) {
+                    publicSlots.add(idx)
+                    publicRules.add(r)
+                }
+            }
+            val sortedPublic = publicRules.sortedWith(
+                compareByDescending<AppRouteRule> { rule ->
+                    rule.sourcePaths.maxOfOrNull { pathDepth(it) } ?: 0
+                }.thenBy { beforeOrder.indexOf(it.id) }
+            )
+            publicSlots.forEachIndexed { i, slotIdx ->
+                rules[slotIdx] = sortedPublic[i]
+            }
+            optimizeRulePriorities(context)
+            reorderedCount = rules.indices.count { rules[it].id != beforeOrder.getOrNull(it) }
+        }
+
+        // 合并重复文件后缀与同目标子规则
+        val claimedExts = hashSetOf<String>()
+        val mergedExts = hashSetOf<String>()
+
+        for (i in rules.indices) {
+            val r = rules[i]
+            if (!r.enabled || r.action == RouteAction.IGNORE) continue
+            val byTarget = linkedMapOf<String, ExtensionSubRule>()
+            for (sub in r.subRules) {
+                val cleanTarget = DefaultRuleRepository.ensureTrailingSlash(sub.targetDir)
+                val kept = mutableListOf<String>()
+                for (rawExt in sub.extensions) {
+                    val ext = rawExt.trim().lowercase().removePrefix(".")
+                    if (ext.isEmpty()) continue
+                    if (claimedExts.add(ext)) {
+                        kept.add(ext)
+                    } else {
+                        mergedExts.add(ext)
+                    }
+                }
+                if (kept.isNotEmpty()) {
+                    val key = cleanTarget.lowercase()
+                    val prev = byTarget[key]
+                    if (prev == null) {
+                        byTarget[key] = sub.copy(targetDir = cleanTarget, extensions = kept)
+                    } else {
+                        val combinedLabel = if (prev.label.contains(sub.label)) prev.label else "${prev.label} / ${sub.label}"
+                        byTarget[key] = prev.copy(
+                            label = combinedLabel,
+                            extensions = (prev.extensions + kept).distinct()
+                        )
+                    }
+                }
+            }
+            rules[i] = r.copy(subRules = byTarget.values.toList())
+        }
+
+        if (reorderedCount > 0 || mergedExts.isNotEmpty()) {
+            saveCustomRules(context)
+            appendLog("规则健康度一键修复完成：重排 $reorderedCount 条优先级 · 合并 ${mergedExts.size} 个重复后缀")
+        }
+        return reorderedCount to mergedExts.size
+    }
+
+    fun moveRule(context: Context, index: Int, delta: Int): Boolean {
+        ensureInit(context)
+        val target = index + delta
+        if (index !in rules.indices || target !in rules.indices) return false
+        val item = rules.removeAt(index)
+        rules.add(target, item)
+        saveCustomRules(context)
+        appendLog("已调整规则优先级：【${item.appName}】移至第 ${target + 1} 位")
+        return true
+    }
+
+    fun resetDefaults(context: Context) {
+        ensureInit(context)
+        rules.clear()
+        rules.addAll(DefaultRuleRepository.initialRules)
+        quickFolders.clear()
+        quickFolders.addAll(DefaultRuleRepository.quickFolders)
+        saveCustomRules(context)
+        saveQuickFolders(context)
+        updateSettings(
+            context = context,
+            universal = true,
+            smartClassify = true,
+            groupByApp = false,
+            eventTriggered = true,
+            powerMode = "event_triggered",
+            writeCheck = true,
+            coalesceBatch = true,
+            verifyDelayMs = 1500L
+        )
+        appendLog("已恢复默认预设规则与触发式唤醒配置")
     }
 
     fun updateRule(context: Context, updated: AppRouteRule) {
@@ -473,6 +739,113 @@ object RuntimeStateStore {
             rules.add(updated)
         }
         saveCustomRules(context)
+    }
+
+    /**
+     * 将本机探测到的真实目录一键绑定到对应规则（若无匹配规则则自动新建）
+     */
+    fun bindDiscoveredPathToRule(
+        context: Context,
+        dirPath: String,
+        inferredAppName: String,
+        matchedRuleId: String?
+    ): String {
+        ensureInit(context)
+        val cleanPath = DefaultRuleRepository.ensureTrailingSlash(dirPath)
+        val targetIdx = if (matchedRuleId != null) {
+            rules.indexOfFirst { it.id == matchedRuleId }
+        } else {
+            -1
+        }
+
+        if (targetIdx >= 0) {
+            val base = rules[targetIdx]
+            val merged = (base.sourcePaths.map { DefaultRuleRepository.ensureTrailingSlash(it) } + cleanPath)
+                .distinctBy { it.lowercase(Locale.ROOT) }
+            rules[targetIdx] = base.copy(
+                enabled = true,
+                channel = ChannelMode.PUBLIC_OBSERVER,
+                sourcePaths = merged
+            )
+            saveCustomRules(context)
+            appendLog("已将真实目录绑定至【${base.appName}】：$cleanPath")
+            return "已绑定至「${base.appName}」规则"
+        }
+
+        val alreadyRule = rules.firstOrNull { r ->
+            r.sourcePaths.any { DefaultRuleRepository.ensureTrailingSlash(it).equals(cleanPath, ignoreCase = true) }
+        }
+        if (alreadyRule != null) {
+            return "该目录已在「${alreadyRule.appName}」监控中"
+        }
+
+        val folderLabel = cleanPath.trimEnd('/').substringAfterLast('/').ifBlank { inferredAppName }
+        val newRule = AppRouteRule(
+            id = "rule_auto_${System.currentTimeMillis()}",
+            appName = if (inferredAppName.isNotBlank()) inferredAppName else folderLabel,
+            packageName = "custom.discovered",
+            enabled = true,
+            passiveWakeEnabled = true,
+            passiveTrigger = PassiveTriggerType.MEDIASTORE_TRIGGER,
+            channel = ChannelMode.PUBLIC_OBSERVER,
+            action = RouteAction.PROMPT,
+            sourcePaths = listOf(cleanPath),
+            defaultTargetDir = DefaultRuleRepository.ensureTrailingSlash("/storage/emulated/0/Documents/${folderLabel}归档/"),
+            renamePattern = "{name}",
+            subRules = emptyList()
+        )
+        rules.add(0, newRule)
+        saveCustomRules(context)
+        appendLog("已为本机目录新建监控规则【${newRule.appName}】：$cleanPath")
+        return "已新建「${newRule.appName}」监控规则"
+    }
+
+    /**
+     * 一键校准全部监控规则：用本机真实存在的目录替换不存在的预设路径，并补齐新发现的应用目录
+     */
+    fun autoCalibrateAllRules(
+        context: Context,
+        discovered: List<DiscoveredDeviceDir>
+    ): Pair<Int, Int> {
+        ensureInit(context)
+        if (discovered.isEmpty()) return 0 to 0
+
+        val byRuleId = discovered
+            .filter { it.matchedRuleId != null }
+            .groupBy { it.matchedRuleId!! }
+
+        var updatedRuleCount = 0
+        var totalBoundPaths = 0
+
+        byRuleId.forEach { (ruleId, dirs) ->
+            val idx = rules.indexOfFirst { it.id == ruleId }
+            if (idx >= 0) {
+                val base = rules[idx]
+                val existingValidPaths = base.sourcePaths
+                    .map { DefaultRuleRepository.ensureTrailingSlash(it) }
+                    .filter { p ->
+                        val f = File(p)
+                        f.exists() && f.isDirectory
+                    }
+                val discoveredPaths = dirs.map { DefaultRuleRepository.ensureTrailingSlash(it.path) }
+                val finalPaths = (existingValidPaths + discoveredPaths)
+                    .distinctBy { it.lowercase(Locale.ROOT) }
+                if (finalPaths.isNotEmpty()) {
+                    rules[idx] = base.copy(
+                        enabled = true,
+                        sourcePaths = finalPaths
+                    )
+                    updatedRuleCount++
+                    totalBoundPaths += discoveredPaths.size
+                }
+            }
+        }
+
+        if (updatedRuleCount > 0) {
+            saveCustomRules(context)
+            appendLog("一键路径校准完成：已校准 $updatedRuleCount 条规则，绑定 $totalBoundPaths 个本机真实目录")
+        }
+        return updatedRuleCount to totalBoundPaths
     }
 
     private fun saveHistory(context: Context) {
@@ -535,6 +908,8 @@ object RuntimeStateStore {
                 put("action", r.action.name)
                 put("defaultTargetDir", r.defaultTargetDir)
                 put("sourcePaths", JSONArray(r.sourcePaths))
+                put("cleanupStrategy", r.cleanupStrategy)
+                put("cleanupDelayDays", r.cleanupDelayDays)
             })
         }
         context.applicationContext.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
@@ -557,6 +932,8 @@ object RuntimeStateStore {
                 }
                 val action = runCatching { RouteAction.valueOf(o.optString("action")) }
                     .getOrDefault(RouteAction.PROMPT)
+                val cleanupStrategy = o.optString("cleanupStrategy", "keep")
+                val cleanupDelayDays = o.optInt("cleanupDelayDays", 7).coerceIn(1, 90)
                 val existingIdx = rules.indexOfFirst { it.id == id }
                 if (existingIdx >= 0) {
                     val base = rules[existingIdx]
@@ -564,7 +941,9 @@ object RuntimeStateStore {
                         enabled = o.optBoolean("enabled", base.enabled),
                         action = action,
                         defaultTargetDir = o.optString("defaultTargetDir", base.defaultTargetDir),
-                        sourcePaths = if (paths.isNotEmpty()) paths else base.sourcePaths
+                        sourcePaths = if (paths.isNotEmpty()) paths else base.sourcePaths,
+                        cleanupStrategy = cleanupStrategy,
+                        cleanupDelayDays = cleanupDelayDays
                     )
                 } else if (id.isNotBlank()) {
                     rules.add(
@@ -580,7 +959,9 @@ object RuntimeStateStore {
                             sourcePaths = paths,
                             defaultTargetDir = o.optString("defaultTargetDir", "/storage/emulated/0/Documents/"),
                             renamePattern = "{name}",
-                            subRules = emptyList()
+                            subRules = emptyList(),
+                            cleanupStrategy = cleanupStrategy,
+                            cleanupDelayDays = cleanupDelayDays
                         )
                     )
                 }
