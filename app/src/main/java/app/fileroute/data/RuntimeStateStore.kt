@@ -857,10 +857,8 @@ object RuntimeStateStore {
 
             val primaryIdx = matchedIndices.first()
             val primary = rules[primaryIdx]
-            val primaryFirstSub = primary.subRules.firstOrNull { norm(it.targetDir) == dirKey }
             val cleanBaseLabel = firstLabel.removeSuffix("（已合并）")
             val consolidatedSub = ExtensionSubRule(
-                id = primaryFirstSub?.id ?: "sub_merged_${System.currentTimeMillis()}",
                 label = "${cleanBaseLabel}（已合并）",
                 extensions = collectedExts.toList(),
                 targetDir = displayDir
