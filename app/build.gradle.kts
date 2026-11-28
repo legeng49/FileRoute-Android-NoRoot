@@ -14,8 +14,8 @@ android {
         applicationId = "app.fileroute"
         minSdk = 26
         targetSdk = 37
-        versionCode = 9
-        versionName = "3.2.2-android17"
+        versionCode = 10
+        versionName = "3.3.0-android17"
     }
 
     signingConfigs {

@@ -1,6 +1,7 @@
 package app.fileroute
 
 import android.Manifest
+import android.app.Activity
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
@@ -8,6 +9,9 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Environment
 import android.os.PowerManager
+import android.os.VibrationEffect
+import android.os.Vibrator
+import android.os.VibratorManager
 import android.provider.Settings
 import android.widget.Toast
 import androidx.activity.ComponentActivity
@@ -15,6 +19,8 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
@@ -74,16 +80,21 @@ import app.fileroute.data.RouteAction
 import app.fileroute.data.RuntimeStateStore
 import app.fileroute.service.DownloadMonitorService
 import app.fileroute.util.DownloadDiscoveryEngine
+import app.fileroute.util.NativeDirectoryPicker
 import app.fileroute.util.NotificationHelper
 import android.os.Handler
 import android.os.Looper
 import android.provider.DocumentsContract
 import java.io.File
+import java.util.Locale
 import java.util.concurrent.Executors
 import app.fileroute.shizuku.ShizukuPrivateDirBridge
 import app.fileroute.update.GitHubReleaseInfo
 import app.fileroute.update.GitHubReleaseUpdater
 import app.fileroute.worker.DownloadTriggerWorker
+import app.fileroute.worker.StaleFileCleanupWorker
+import app.fileroute.worker.StorageDeepAnalyzer
+import app.fileroute.worker.StorageDeepScanReport
 
 private val FileRouteColorScheme = lightColorScheme(
     primary = Color(0xFF2563EB),
@@ -138,6 +149,7 @@ fun FileRouteMainApp() {
     var selectedTab by remember { mutableIntStateOf(0) }
     var hasAllFilesAccess by remember { mutableStateOf(DownloadDiscoveryEngine.hasAllFilesAccess()) }
     var hasNotifPerm by remember { mutableStateOf(NotificationHelper.hasNotificationPermission(context)) }
+    var canDrawOverlays by remember { mutableStateOf(NotificationHelper.canDrawOverlays(context)) }
     var ignoringBattery by remember { mutableStateOf(isBatteryOptIgnored(context)) }
     var activePickerItem by remember { mutableStateOf<DetectedDownloadItem?>(null) }
     var availableUpdate by remember { mutableStateOf<GitHubReleaseInfo?>(null) }
@@ -184,21 +196,26 @@ fun FileRouteMainApp() {
         }
     }
 
-    // 每次从系统设置返回 App 时自动刷新权限状态，并静默同步最近下载
+    // 每次从系统设置返回 App 时自动刷新权限状态，并在后台线程安全同步最近下载（不阻塞主线程、不静默吞掉新文件）
     DisposableEffect(context) {
         val owner = context as? LifecycleOwner
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_RESUME) {
                 hasAllFilesAccess = DownloadDiscoveryEngine.hasAllFilesAccess()
                 hasNotifPerm = NotificationHelper.hasNotificationPermission(context)
+                canDrawOverlays = NotificationHelper.canDrawOverlays(context)
                 ignoringBattery = isBatteryOptIgnored(context)
                 if (hasAllFilesAccess) {
-                    DownloadDiscoveryEngine.scanAndProcessRecent(
-                        context = context,
-                        lookbackMinutes = 60,
-                        notifyUser = false,
-                        includeAlreadyHandledInPending = false
-                    )
+                    val bg = Executors.newSingleThreadExecutor()
+                    bg.execute {
+                        DownloadDiscoveryEngine.scanAndProcessRecent(
+                            context = context,
+                            lookbackMinutes = 60,
+                            notifyUser = false,
+                            includeAlreadyHandledInPending = false
+                        )
+                        bg.shutdown()
+                    }
                 }
             }
         }
@@ -246,6 +263,7 @@ fun FileRouteMainApp() {
                     0 -> MonitorHomeTab(
                         hasAllFilesAccess = hasAllFilesAccess,
                         hasNotifPerm = hasNotifPerm,
+                        canDrawOverlays = canDrawOverlays,
                         ignoringBattery = ignoringBattery,
                         onRequestNotif = {
                             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -350,11 +368,21 @@ fun FileRouteMainApp() {
         }
     }
 
-    // 应用内底部目录选择器（直接点待归位文件即可真实移动/复制，支持实时同名冲突检测）
+    // 应用内底部目录选择器（直接点待归位文件即可真实移动/复制，支持可视化文件夹浏览器 + 系统文件管理器选取）
     activePickerItem?.let { item ->
         var selectedDir by remember(item.id) { mutableStateOf(item.suggestedTargetDir) }
+        var showFolderBrowser by remember(item.id) { mutableStateOf(false) }
         var copyOnly by remember(item.id) { mutableStateOf(false) }
         var conflictStrategy by remember(item.id) { mutableStateOf("rename_timestamp") }
+        val pickerTreeLauncher = rememberLauncherForActivityResult(
+            ActivityResultContracts.OpenDocumentTree()
+        ) { treeUri ->
+            val resolved = app.fileroute.ui.safTreeUriToRealPath(treeUri)
+            if (!resolved.isNullOrBlank()) {
+                selectedDir = resolved
+                Toast.makeText(context, "已选择目录：$resolved", Toast.LENGTH_SHORT).show()
+            }
+        }
         val existingConflict = remember(selectedDir, item.fileName) {
             DownloadDiscoveryEngine.findExistingConflict(selectedDir, item.fileName)
         }
@@ -373,10 +401,23 @@ fun FileRouteMainApp() {
             DownloadDiscoveryEngine.buildTimestampedFileName(item.fileName)
         }
 
+        if (showFolderBrowser) {
+            app.fileroute.ui.FolderBrowserDialog(
+                initialPath = selectedDir,
+                onDismiss = { showFolderBrowser = false },
+                onConfirm = { picked ->
+                    selectedDir = picked
+                    showFolderBrowser = false
+                },
+                onOpenSystemPicker = { pickerTreeLauncher.launch(null) }
+            )
+        }
+
         ModalBottomSheet(onDismissRequest = { activePickerItem = null }) {
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
+                    .verticalScroll(rememberScrollState())
                     .padding(horizontal = 20.dp, vertical = 12.dp),
                 verticalArrangement = Arrangement.spacedBy(12.dp)
             ) {
@@ -386,10 +427,27 @@ fun FileRouteMainApp() {
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    FilledTonalButton(
+                        onClick = { showFolderBrowser = true },
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Text("浏览文件夹...")
+                    }
+                    OutlinedButton(
+                        onClick = { pickerTreeLauncher.launch(null) },
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Text("系统文件管理器")
+                    }
+                }
                 OutlinedTextField(
                     value = selectedDir,
                     onValueChange = { selectedDir = it },
-                    label = { Text("目标目录路径") },
+                    label = { Text("目标目录路径（支持上方浏览选择）") },
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth()
                 )
@@ -656,6 +714,7 @@ fun FileRouteMainApp() {
 private fun MonitorHomeTab(
     hasAllFilesAccess: Boolean,
     hasNotifPerm: Boolean,
+    canDrawOverlays: Boolean,
     ignoringBattery: Boolean,
     onRequestNotif: () -> Unit,
     onOpenPicker: (DetectedDownloadItem) -> Unit,
@@ -667,7 +726,7 @@ private fun MonitorHomeTab(
     val rules = RuntimeStateStore.rules
     val armed = RuntimeStateStore.guardArmed
     val powerMode = RuntimeStateStore.powerModeName
-    val allPermsReady = hasAllFilesAccess && hasNotifPerm && ignoringBattery
+    val allPermsReady = hasAllFilesAccess && hasNotifPerm && canDrawOverlays && ignoringBattery
     var showPermDetails by remember { mutableStateOf(!allPermsReady) }
 
     val completedHistory = history.filter { it.status == "completed" }
@@ -779,7 +838,28 @@ private fun MonitorHomeTab(
                         )
                         HorizontalDivider(color = Color(0xFFF1F5F9))
                         PermissionActionRow(
-                            title = "3. 电池不受限（防后台被杀）",
+                            title = "3. 悬浮弹窗权限（在微信上方弹出地址选择框）",
+                            subtitle = if (canDrawOverlays) "已授权 · 微信聊天下载完成后自动弹出目录修改框" else "强烈建议开启，否则小米/HyperOS 后台只会静音收在通知栏",
+                            granted = canDrawOverlays,
+                            actionText = "去开启",
+                            onClick = {
+                                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                                    runCatching {
+                                        context.startActivity(
+                                            Intent(
+                                                Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                                                Uri.parse("package:${context.packageName}")
+                                            )
+                                        )
+                                    }.onFailure {
+                                        context.startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION))
+                                    }
+                                }
+                            }
+                        )
+                        HorizontalDivider(color = Color(0xFFF1F5F9))
+                        PermissionActionRow(
+                            title = "4. 电池不受限（防后台被杀）",
                             subtitle = if (ignoringBattery) "已加入电池白名单" else "建议设为无限制，避免系统杀后台",
                             granted = ignoringBattery,
                             actionText = "去设置",
@@ -802,7 +882,7 @@ private fun MonitorHomeTab(
                                 ShizukuPrivateDirBridge.permissionGranted &&
                                 ShizukuPrivateDirBridge.serviceBound
                             PermissionActionRow(
-                                title = "4. Shizuku 微信/QQ 聊天直采（可选）",
+                                title = "5. Shizuku 微信/QQ 聊天直采",
                                 subtitle = ShizukuPrivateDirBridge.statusText,
                                 granted = shizukuReady,
                                 actionText = when {
@@ -2101,7 +2181,50 @@ private fun TargetMountQuickPickerSection(
         }
     }
 
+    val context = LocalContext.current
+    var showFolderBrowser by remember { mutableStateOf(false) }
+    val systemFolderLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocumentTree()
+    ) { treeUri ->
+        val resolved = app.fileroute.ui.safTreeUriToRealPath(treeUri)
+        if (!resolved.isNullOrBlank()) {
+            onSelectPath(resolved)
+            Toast.makeText(context, "已选择目录：$resolved", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    if (showFolderBrowser) {
+        app.fileroute.ui.FolderBrowserDialog(
+            initialPath = canonical.ifEmpty { "$extRoot/Documents/" },
+            onDismiss = { showFolderBrowser = false },
+            onConfirm = { picked ->
+                onSelectPath(picked)
+                showFolderBrowser = false
+            },
+            onOpenSystemPicker = { systemFolderLauncher.launch(null) }
+        )
+    }
+
     Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            FilledTonalButton(
+                onClick = { showFolderBrowser = true },
+                modifier = Modifier.weight(1f),
+                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp)
+            ) {
+                Text("浏览文件夹...", style = MaterialTheme.typography.labelSmall)
+            }
+            OutlinedButton(
+                onClick = { systemFolderLauncher.launch(null) },
+                modifier = Modifier.weight(1f),
+                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp)
+            ) {
+                Text("系统文件管理器", style = MaterialTheme.typography.labelSmall)
+            }
+        }
         Text(
             "常用导出路径快速选择器",
             style = MaterialTheme.typography.labelSmall,
@@ -2791,6 +2914,58 @@ private fun SettingsManageTab(
         }
     }
 
+    var pendingPickerCallback by remember { mutableStateOf<((String) -> Unit)?>(null) }
+    var pendingPickerInitialPath by remember { mutableStateOf("/storage/emulated/0/Documents/") }
+    var fallbackBrowserInitialPath by remember { mutableStateOf<String?>(null) }
+    var fallbackBrowserCallback by remember { mutableStateOf<((String) -> Unit)?>(null) }
+
+    val documentPickerLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        val callback = pendingPickerCallback
+        pendingPickerCallback = null
+        if (result.resultCode != Activity.RESULT_OK || callback == null) return@rememberLauncherForActivityResult
+
+        val pickedUri = result.data?.data
+        val canonicalPath = NativeDirectoryPicker.normalizePickedTreeUri(context, pickedUri)
+        if (canonicalPath != null) {
+            callback(canonicalPath)
+            Toast.makeText(
+                context,
+                "已选定规范路径：$canonicalPath（挂载点：${NativeDirectoryPicker.toDisplayMountPath(canonicalPath)}）",
+                Toast.LENGTH_LONG
+            ).show()
+        } else {
+            Toast.makeText(
+                context,
+                "当前文件管理器返回的目录不支持自动解析，已打开内置目录浏览器供选择",
+                Toast.LENGTH_LONG
+            ).show()
+            fallbackBrowserInitialPath = pendingPickerInitialPath
+            fallbackBrowserCallback = callback
+        }
+    }
+
+    fun launchNativeFilePicker(initialPath: String, onPicked: (String) -> Unit) {
+        val normalizedInit = NativeDirectoryPicker.normalizeCanonicalPath(initialPath)
+        pendingPickerInitialPath = normalizedInit
+        pendingPickerCallback = onPicked
+        val intent = NativeDirectoryPicker.buildDocumentTreeIntent(normalizedInit)
+        runCatching {
+            documentPickerLauncher.launch(intent)
+        }.onFailure {
+            pendingPickerCallback = null
+            Toast.makeText(
+                context,
+                "未检测到系统文档选择器，已切换内置图形化目录浏览器",
+                Toast.LENGTH_SHORT
+            ).show()
+            fallbackBrowserInitialPath = normalizedInit
+            fallbackBrowserCallback = onPicked
+        }
+    }
+
+    var showTargetPathsPanel by remember { mutableStateOf(true) }
     var showHealthPanel by remember { mutableStateOf(autoExpandHealthTrigger > 0) }
     var showBackupPanel by remember { mutableStateOf(false) }
     var showAdvancedPanel by remember { mutableStateOf(false) }
@@ -2853,6 +3028,646 @@ private fun SettingsManageTab(
                         }
                     ) {
                         Text(if (isScanningStorage) "正在自动优化..." else "一键智能优化")
+                    }
+                }
+            }
+        }
+
+        // 1.1. 存储空间深度分析（扫描各应用规则预设目标目录 + 超过 30 天过时旧文件定时清理）
+        item {
+            var deepReport by remember { mutableStateOf<StorageDeepScanReport?>(null) }
+            var isAnalyzingStorage by remember { mutableStateOf(false) }
+            var isPurgingStale by remember { mutableStateOf(false) }
+            var cleanupProgressRaw by remember { mutableStateOf(0f) }
+            var cleanupCurrentFile by remember { mutableStateOf("") }
+            var cleanupProcessedCount by remember { mutableStateOf(0) }
+            var cleanupTotalCount by remember { mutableStateOf(0) }
+            var cleanupFreedBytesLive by remember { mutableStateOf(0L) }
+            var lastFreedSummaryText by remember { mutableStateOf<String?>(null) }
+            var showDeepStoragePanel by remember { mutableStateOf(true) }
+
+            val animatedCleanupProgress by animateFloatAsState(
+                targetValue = cleanupProgressRaw.coerceIn(0f, 1f),
+                animationSpec = tween(durationMillis = 220),
+                label = "stale_cleanup_progress"
+            )
+
+            fun triggerLightCleanupHaptic() {
+                runCatching {
+                    val vibrator = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                        val vm = context.getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as? VibratorManager
+                        vm?.defaultVibrator
+                    } else {
+                        @Suppress("DEPRECATION")
+                        context.getSystemService(Context.VIBRATOR_SERVICE) as? Vibrator
+                    }
+                    if (vibrator?.hasVibrator() == true) {
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                            vibrator.vibrate(VibrationEffect.createPredefined(VibrationEffect.EFFECT_CLICK))
+                        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                            vibrator.vibrate(VibrationEffect.createOneShot(20L, 90))
+                        } else {
+                            @Suppress("DEPRECATION")
+                            vibrator.vibrate(20L)
+                        }
+                    }
+                }
+            }
+
+            fun formatMbText(bytes: Long): String {
+                val mb = bytes.coerceAtLeast(0L) / (1024.0 * 1024.0)
+                return String.format(Locale.US, "%.2f MB", mb)
+            }
+
+            fun triggerDeepScan(showToast: Boolean) {
+                if (isAnalyzingStorage) return
+                isAnalyzingStorage = true
+                val executor = Executors.newSingleThreadExecutor()
+                val mainHandler = Handler(Looper.getMainLooper())
+                executor.execute {
+                    val report = StorageDeepAnalyzer.scanAllRuleTargets(context)
+                    mainHandler.post {
+                        deepReport = report
+                        isAnalyzingStorage = false
+                        if (showToast) {
+                            Toast.makeText(
+                                context,
+                                "深度扫描完成：共 ${report.totalFiles} 个文件（${DefaultRuleRepository.formatSize(report.totalBytes)}），超过 30 天旧文件 ${report.staleFiles} 个",
+                                Toast.LENGTH_LONG
+                            ).show()
+                        }
+                    }
+                    executor.shutdown()
+                }
+            }
+
+            LaunchedEffect(RuntimeStateStore.rules.size) {
+                if (deepReport == null) {
+                    triggerDeepScan(showToast = false)
+                }
+            }
+
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(16.dp),
+                colors = CardDefaults.cardColors(containerColor = Color.White),
+                border = BorderStroke(1.dp, Color(0xFFE2E8F0))
+            ) {
+                Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable { showDeepStoragePanel = !showDeepStoragePanel },
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f).padding(end = 8.dp)) {
+                            Text(
+                                "存储空间深度分析",
+                                style = MaterialTheme.typography.titleMedium,
+                                fontWeight = FontWeight.SemiBold
+                            )
+                            Text(
+                                if (deepReport != null) {
+                                    "共占 ${DefaultRuleRepository.formatSize(deepReport!!.totalBytes)} · ${deepReport!!.scannedDirCount} 个目录 · 超过 30 天旧文件 ${deepReport!!.staleFiles} 项（可释放 ${formatMbText(deepReport!!.staleBytes)}）"
+                                } else {
+                                    "扫描各应用预设目标目录，按规则展示文件大小明细与超过 30 天旧文件"
+                                },
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                        Icon(
+                            imageVector = if (showDeepStoragePanel) Icons.Default.KeyboardArrowUp else Icons.Default.KeyboardArrowDown,
+                            contentDescription = "展开或收起存储空间深度分析",
+                            tint = Color(0xFF64748B)
+                        )
+                    }
+
+                    if (showDeepStoragePanel) {
+                        Surface(
+                            color = Color(0xFFF8FAFC),
+                            shape = RoundedCornerShape(12.dp),
+                            border = BorderStroke(1.dp, Color(0xFFE2E8F0))
+                        ) {
+                            Column(
+                                modifier = Modifier.fillMaxWidth().padding(12.dp),
+                                verticalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Column(modifier = Modifier.weight(1f).padding(end = 8.dp)) {
+                                        Text(
+                                            "一键删除过时旧文件（超过 30 天）定时清理",
+                                            style = MaterialTheme.typography.bodyMedium,
+                                            fontWeight = FontWeight.Medium
+                                        )
+                                        Text(
+                                            if (RuntimeStateStore.staleCleanup30dEnabled)
+                                                "已开启：WorkManager 每日自动巡检目标目录并清理超过 30 天旧文件"
+                                            else
+                                                "未开启：仅手动点击下方一键清理时执行删除",
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = if (RuntimeStateStore.staleCleanup30dEnabled) Color(0xFF0F766E) else MaterialTheme.colorScheme.onSurfaceVariant
+                                        )
+                                    }
+                                    Switch(
+                                        checked = RuntimeStateStore.staleCleanup30dEnabled,
+                                        onCheckedChange = { enabled ->
+                                            RuntimeStateStore.updateSettings(context, staleCleanup30d = enabled)
+                                            StaleFileCleanupWorker.syncSchedule(context, enabled)
+                                            Toast.makeText(
+                                                context,
+                                                if (enabled) "已开启 30 天过时旧文件每日定时清理任务" else "已关闭 30 天过时旧文件定时清理任务",
+                                                Toast.LENGTH_SHORT
+                                            ).show()
+                                        }
+                                    )
+                                }
+
+                                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                    OutlinedButton(
+                                        enabled = !isAnalyzingStorage && !isPurgingStale,
+                                        onClick = { triggerDeepScan(showToast = true) }
+                                    ) {
+                                        Text(if (isAnalyzingStorage) "扫描中..." else "重新深度扫描")
+                                    }
+                                    Button(
+                                        enabled = !isPurgingStale && (deepReport?.staleFiles ?: 0) > 0,
+                                        onClick = {
+                                            isPurgingStale = true
+                                            cleanupProgressRaw = 0.08f
+                                            cleanupProcessedCount = 0
+                                            cleanupTotalCount = deepReport?.staleFiles ?: 0
+                                            cleanupFreedBytesLive = 0L
+                                            cleanupCurrentFile = "正在准备清理任务..."
+                                            lastFreedSummaryText = null
+                                            val executor = Executors.newSingleThreadExecutor()
+                                            val mainHandler = Handler(Looper.getMainLooper())
+                                            executor.execute {
+                                                val (deleted, freed) = StorageDeepAnalyzer.deleteStaleFiles(
+                                                    context = context,
+                                                    onProgress = { processed, total, freedSoFar, name ->
+                                                        val ratio = if (total > 0) processed.toFloat() / total.toFloat() else 1f
+                                                        mainHandler.post {
+                                                            cleanupProcessedCount = processed
+                                                            cleanupTotalCount = total
+                                                            cleanupFreedBytesLive = freedSoFar
+                                                            cleanupCurrentFile = name
+                                                            cleanupProgressRaw = ratio.coerceIn(0.08f, 1f)
+                                                        }
+                                                        runCatching { Thread.sleep(45L) }
+                                                    }
+                                                )
+                                                val refreshed = StorageDeepAnalyzer.scanAllRuleTargets(context)
+                                                mainHandler.post {
+                                                    cleanupProgressRaw = 1f
+                                                    deepReport = refreshed
+                                                    isPurgingStale = false
+                                                    triggerLightCleanupHaptic()
+                                                    val freedMb = formatMbText(freed)
+                                                    lastFreedSummaryText = if (deleted > 0) {
+                                                        "清理完成 · 本次任务共释放 $freedMb 磁盘空间（删除 $deleted 个超过 30 天旧文件）"
+                                                    } else {
+                                                        "未发现可删除的超过 30 天旧文件（释放 0.00 MB）"
+                                                    }
+                                                    Toast.makeText(
+                                                        context,
+                                                        lastFreedSummaryText!!,
+                                                        Toast.LENGTH_LONG
+                                                    ).show()
+                                                }
+                                                executor.shutdown()
+                                            }
+                                        }
+                                    ) {
+                                        Text(
+                                            if (isPurgingStale) "清理中 ${(animatedCleanupProgress * 100).toInt()}%..."
+                                            else if ((deepReport?.staleFiles ?: 0) > 0) "一键删除旧文件(${deepReport!!.staleFiles})"
+                                            else "暂无过时旧文件"
+                                        )
+                                    }
+                                }
+
+                                if (isPurgingStale) {
+                                    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                                        Row(
+                                            modifier = Modifier.fillMaxWidth(),
+                                            horizontalArrangement = Arrangement.SpaceBetween
+                                        ) {
+                                            Text(
+                                                cleanupCurrentFile,
+                                                modifier = Modifier.weight(1f).padding(end = 8.dp),
+                                                style = MaterialTheme.typography.labelSmall,
+                                                fontFamily = FontFamily.Monospace,
+                                                color = Color(0xFF475569),
+                                                maxLines = 1,
+                                                overflow = TextOverflow.Ellipsis
+                                            )
+                                            Text(
+                                                "已释放 ${formatMbText(cleanupFreedBytesLive)} · $cleanupProcessedCount/$cleanupTotalCount",
+                                                style = MaterialTheme.typography.labelSmall,
+                                                fontFamily = FontFamily.Monospace,
+                                                color = Color(0xFF1D4ED8),
+                                                fontWeight = FontWeight.SemiBold
+                                            )
+                                        }
+                                        LinearProgressIndicator(
+                                            progress = { animatedCleanupProgress },
+                                            modifier = Modifier.fillMaxWidth().height(6.dp),
+                                            color = Color(0xFF2563EB),
+                                            trackColor = Color(0xFFE2E8F0)
+                                        )
+                                    }
+                                } else if (!lastFreedSummaryText.isNullOrBlank()) {
+                                    Surface(
+                                        color = Color(0xFFF0FDFA),
+                                        shape = RoundedCornerShape(10.dp),
+                                        border = BorderStroke(1.dp, Color(0xFF99F6E4))
+                                    ) {
+                                        Text(
+                                            lastFreedSummaryText!!,
+                                            modifier = Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 8.dp),
+                                            style = MaterialTheme.typography.labelMedium,
+                                            color = Color(0xFF0F766E),
+                                            fontWeight = FontWeight.SemiBold
+                                        )
+                                    }
+                                }
+                            }
+                        }
+
+                        deepReport?.cards?.forEach { card ->
+                            Surface(
+                                color = Color(0xFFF8FAFC),
+                                shape = RoundedCornerShape(12.dp),
+                                border = BorderStroke(1.dp, Color(0xFFE2E8F0))
+                            ) {
+                                Column(
+                                    modifier = Modifier.fillMaxWidth().padding(12.dp),
+                                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                                ) {
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Column(modifier = Modifier.weight(1f).padding(end = 8.dp)) {
+                                            Text(
+                                                card.appName,
+                                                style = MaterialTheme.typography.bodyMedium,
+                                                fontWeight = FontWeight.SemiBold,
+                                                maxLines = 1,
+                                                overflow = TextOverflow.Ellipsis
+                                            )
+                                            Text(
+                                                card.targetDirs.firstOrNull().orEmpty(),
+                                                style = MaterialTheme.typography.labelSmall,
+                                                fontFamily = FontFamily.Monospace,
+                                                color = Color(0xFF64748B),
+                                                maxLines = 1,
+                                                overflow = TextOverflow.Ellipsis
+                                            )
+                                        }
+                                        Column(horizontalAlignment = Alignment.End) {
+                                            Text(
+                                                DefaultRuleRepository.formatSize(card.totalBytes),
+                                                style = MaterialTheme.typography.bodyMedium,
+                                                fontWeight = FontWeight.Bold,
+                                                color = Color(0xFF0F172A)
+                                            )
+                                            Text(
+                                                if (card.staleCount > 0) "${card.fileCount} 项 · 过时 ${card.staleCount} 项"
+                                                else "${card.fileCount} 项 · 无过时",
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = if (card.staleCount > 0) Color(0xFFB45309) else Color(0xFF0F766E)
+                                            )
+                                        }
+                                    }
+
+                                    if (card.topFiles.isNotEmpty()) {
+                                        HorizontalDivider(color = Color(0xFFE2E8F0))
+                                        card.topFiles.take(4).forEach { fileItem ->
+                                            Row(
+                                                modifier = Modifier.fillMaxWidth(),
+                                                horizontalArrangement = Arrangement.SpaceBetween,
+                                                verticalAlignment = Alignment.CenterVertically
+                                            ) {
+                                                Text(
+                                                    fileItem.name,
+                                                    modifier = Modifier.weight(1f).padding(end = 8.dp),
+                                                    style = MaterialTheme.typography.labelSmall,
+                                                    color = Color(0xFF334155),
+                                                    maxLines = 1,
+                                                    overflow = TextOverflow.Ellipsis
+                                                )
+                                                Text(
+                                                    "${DefaultRuleRepository.formatSize(fileItem.sizeBytes)} · ${if (fileItem.isStale) "${fileItem.ageDays}天(过时)" else "${fileItem.ageDays}天"}",
+                                                    style = MaterialTheme.typography.labelSmall,
+                                                    fontFamily = FontFamily.Monospace,
+                                                    color = if (fileItem.isStale) Color(0xFFB45309) else Color(0xFF64748B)
+                                                )
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 1.2. 目标路径配置（系统文档选择器 FilePicker，统一路径归一化）
+        item {
+            val totalSubRulePaths = RuntimeStateStore.rules.sumOf { it.subRules.size }
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(16.dp),
+                colors = CardDefaults.cardColors(containerColor = Color.White),
+                border = BorderStroke(1.dp, Color(0xFFE2E8F0))
+            ) {
+                Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable { showTargetPathsPanel = !showTargetPathsPanel },
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f).padding(end = 8.dp)) {
+                            Text(
+                                "目标路径配置（系统文档选择器 FilePicker）",
+                                style = MaterialTheme.typography.titleMedium,
+                                fontWeight = FontWeight.SemiBold
+                            )
+                            Text(
+                                "共 ${RuntimeStateStore.rules.size} 条规则目标 · $totalSubRulePaths 条后缀子目录 · ${RuntimeStateStore.quickFolders.size} 个常用目录 · 全部通过系统文件管理器选取",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                        Icon(
+                            imageVector = if (showTargetPathsPanel) Icons.Default.KeyboardArrowUp else Icons.Default.KeyboardArrowDown,
+                            contentDescription = "展开或收起目标路径配置",
+                            tint = Color(0xFF64748B)
+                        )
+                    }
+
+                    if (showTargetPathsPanel) {
+                        Surface(color = Color(0xFFEFF6FF), shape = RoundedCornerShape(10.dp)) {
+                            Text(
+                                "点击任意「文档选择器」按钮将通过 Android 原生 Intent (ACTION_OPEN_DOCUMENT_TREE) 拉起系统文档选择器或文件管理器，选定目录后自动规范化为 /storage/emulated/0/.../，避免手动输入绝对路径出错。",
+                                modifier = Modifier.fillMaxWidth().padding(10.dp),
+                                style = MaterialTheme.typography.labelSmall,
+                                color = Color(0xFF1E40AF)
+                            )
+                        }
+
+                        // A. Shizuku 聊天自动移入目标目录
+                        Text(
+                            "微信 / QQ 聊天直采自动移入目录",
+                            style = MaterialTheme.typography.labelLarge,
+                            fontWeight = FontWeight.SemiBold,
+                            color = Color(0xFF0F172A)
+                        )
+                        Surface(
+                            color = Color(0xFFF8FAFC),
+                            shape = RoundedCornerShape(12.dp),
+                            border = BorderStroke(1.dp, Color(0xFFE2E8F0))
+                        ) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth().padding(12.dp),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Column(modifier = Modifier.weight(1f).padding(end = 10.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                                    Text(
+                                        "Shizuku 自动归档目标路径",
+                                        style = MaterialTheme.typography.bodyMedium,
+                                        fontWeight = FontWeight.Medium
+                                    )
+                                    Text(
+                                        RuntimeStateStore.shizukuTargetDir,
+                                        style = MaterialTheme.typography.labelSmall,
+                                        fontFamily = FontFamily.Monospace,
+                                        color = Color(0xFF1D4ED8),
+                                        maxLines = 2,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                    Text(
+                                        "挂载点：${NativeDirectoryPicker.toDisplayMountPath(RuntimeStateStore.shizukuTargetDir)}",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                }
+                                OutlinedButton(
+                                    onClick = {
+                                        launchNativeFilePicker(RuntimeStateStore.shizukuTargetDir) { picked ->
+                                            RuntimeStateStore.updateSettings(context, shizukuTarget = picked)
+                                            DownloadMonitorService.reloadIfRunning(context)
+                                        }
+                                    },
+                                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
+                                ) {
+                                    Text("文档选择器", style = MaterialTheme.typography.labelMedium)
+                                }
+                            }
+                        }
+
+                        // B. 各应用规则默认目标目录及后缀子规则目录
+                        Text(
+                            "应用归位规则目标目录（${RuntimeStateStore.rules.size} 条）",
+                            style = MaterialTheme.typography.labelLarge,
+                            fontWeight = FontWeight.SemiBold,
+                            color = Color(0xFF0F172A)
+                        )
+                        RuntimeStateStore.rules.forEach { rule ->
+                            val canonicalDefault = NativeDirectoryPicker.normalizeCanonicalPath(rule.defaultTargetDir)
+                            Surface(
+                                color = Color(0xFFF8FAFC),
+                                shape = RoundedCornerShape(12.dp),
+                                border = BorderStroke(1.dp, Color(0xFFE2E8F0))
+                            ) {
+                                Column(
+                                    modifier = Modifier.fillMaxWidth().padding(12.dp),
+                                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                                ) {
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Column(modifier = Modifier.weight(1f).padding(end = 10.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                                            Text(
+                                                rule.appName,
+                                                style = MaterialTheme.typography.bodyMedium,
+                                                fontWeight = FontWeight.SemiBold,
+                                                maxLines = 1,
+                                                overflow = TextOverflow.Ellipsis
+                                            )
+                                            Text(
+                                                canonicalDefault,
+                                                style = MaterialTheme.typography.labelSmall,
+                                                fontFamily = FontFamily.Monospace,
+                                                color = Color(0xFF1D4ED8),
+                                                maxLines = 2,
+                                                overflow = TextOverflow.Ellipsis
+                                            )
+                                            Text(
+                                                "挂载点：${NativeDirectoryPicker.toDisplayMountPath(canonicalDefault)}",
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                                maxLines = 1,
+                                                overflow = TextOverflow.Ellipsis
+                                            )
+                                        }
+                                        OutlinedButton(
+                                            onClick = {
+                                                launchNativeFilePicker(canonicalDefault) { picked ->
+                                                    RuntimeStateStore.updateRuleTargetDir(context, rule.id, picked)
+                                                    DownloadMonitorService.reloadIfRunning(context)
+                                                }
+                                            },
+                                            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
+                                        ) {
+                                            Text("文档选择器", style = MaterialTheme.typography.labelMedium)
+                                        }
+                                    }
+
+                                    if (rule.subRules.isNotEmpty()) {
+                                        HorizontalDivider(color = Color(0xFFE2E8F0))
+                                        rule.subRules.forEachIndexed { subIdx, sub ->
+                                            val canonicalSub = NativeDirectoryPicker.normalizeCanonicalPath(sub.targetDir)
+                                            Row(
+                                                modifier = Modifier.fillMaxWidth(),
+                                                horizontalArrangement = Arrangement.SpaceBetween,
+                                                verticalAlignment = Alignment.CenterVertically
+                                            ) {
+                                                Column(modifier = Modifier.weight(1f).padding(end = 8.dp)) {
+                                                    Text(
+                                                        "${sub.label}（.${sub.extensions.take(4).joinToString("/.")}）",
+                                                        style = MaterialTheme.typography.labelMedium,
+                                                        fontWeight = FontWeight.Medium,
+                                                        color = Color(0xFF334155),
+                                                        maxLines = 1,
+                                                        overflow = TextOverflow.Ellipsis
+                                                    )
+                                                    Text(
+                                                        canonicalSub,
+                                                        style = MaterialTheme.typography.labelSmall,
+                                                        fontFamily = FontFamily.Monospace,
+                                                        color = Color(0xFF0F766E),
+                                                        maxLines = 1,
+                                                        overflow = TextOverflow.Ellipsis
+                                                    )
+                                                }
+                                                TextButton(
+                                                    onClick = {
+                                                        launchNativeFilePicker(canonicalSub) { picked ->
+                                                            RuntimeStateStore.updateRuleSubRuleTargetDir(
+                                                                context,
+                                                                rule.id,
+                                                                subIdx,
+                                                                picked
+                                                            )
+                                                            DownloadMonitorService.reloadIfRunning(context)
+                                                        }
+                                                    },
+                                                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp)
+                                                ) {
+                                                    Text("选择目录", style = MaterialTheme.typography.labelMedium)
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // C. 常用快捷目标目录预设
+                        Text(
+                            "常用快捷目标目录（${RuntimeStateStore.quickFolders.size} 个）",
+                            style = MaterialTheme.typography.labelLarge,
+                            fontWeight = FontWeight.SemiBold,
+                            color = Color(0xFF0F172A)
+                        )
+                        RuntimeStateStore.quickFolders.forEachIndexed { folderIdx, folder ->
+                            val canonicalQuick = NativeDirectoryPicker.normalizeCanonicalPath(folder.path)
+                            Surface(
+                                color = Color(0xFFF8FAFC),
+                                shape = RoundedCornerShape(12.dp),
+                                border = BorderStroke(1.dp, Color(0xFFE2E8F0))
+                            ) {
+                                Row(
+                                    modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 10.dp),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Column(modifier = Modifier.weight(1f).padding(end = 8.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                                        Text(
+                                            folder.label,
+                                            style = MaterialTheme.typography.bodyMedium,
+                                            fontWeight = FontWeight.Medium,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis
+                                        )
+                                        Text(
+                                            canonicalQuick,
+                                            style = MaterialTheme.typography.labelSmall,
+                                            fontFamily = FontFamily.Monospace,
+                                            color = Color(0xFF0F766E),
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis
+                                        )
+                                    }
+                                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                                        OutlinedButton(
+                                            onClick = {
+                                                launchNativeFilePicker(canonicalQuick) { picked ->
+                                                    RuntimeStateStore.updateQuickFolderPath(context, folderIdx, picked)
+                                                }
+                                            },
+                                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp)
+                                        ) {
+                                            Text("更改目录", style = MaterialTheme.typography.labelMedium)
+                                        }
+                                        if (RuntimeStateStore.quickFolders.size > 1) {
+                                            IconButton(
+                                                onClick = { RuntimeStateStore.removeQuickFolder(context, folderIdx) },
+                                                modifier = Modifier.size(34.dp)
+                                            ) {
+                                                Icon(
+                                                    imageVector = Icons.Default.Delete,
+                                                    contentDescription = "删除常用目录",
+                                                    tint = Color(0xFF94A3B8),
+                                                    modifier = Modifier.size(18.dp)
+                                                )
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        Button(
+                            onClick = {
+                                launchNativeFilePicker(NativeDirectoryPicker.externalRoot() + "/Documents/") { picked ->
+                                    val label = NativeDirectoryPicker.suggestFolderLabel(picked)
+                                    RuntimeStateStore.addQuickFolder(context, label, picked, "系统文档选择器添加")
+                                }
+                            },
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Icon(Icons.Default.Add, contentDescription = null, modifier = Modifier.size(18.dp))
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text("通过系统文档选择器添加常用目标目录")
+                        }
                     }
                 }
             }
@@ -3473,9 +4288,9 @@ private fun SettingsManageTab(
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Column(modifier = Modifier.weight(1f).padding(end = 8.dp)) {
-                            Text("新聊天文件自动移至 Documents", style = MaterialTheme.typography.bodyMedium)
+                            Text("新聊天文件自动移至目标目录", style = MaterialTheme.typography.bodyMedium)
                             Text(
-                                "开启后，在微信/QQ 聊天点下新文件时自动移动至 /storage/emulated/0/Documents/（文件管理器「文档」目录）",
+                                "开启后，在微信/QQ 聊天点下新文件时自动移动至 ${RuntimeStateStore.shizukuTargetDir}（挂载点：${NativeDirectoryPicker.toDisplayMountPath(RuntimeStateStore.shizukuTargetDir)}）",
                                 style = MaterialTheme.typography.labelSmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
@@ -3486,6 +4301,44 @@ private fun SettingsManageTab(
                                 RuntimeStateStore.updateSettings(context, shizukuAutoMoveDocs = autoMove)
                             }
                         )
+                    }
+                    Surface(
+                        color = Color(0xFFF8FAFC),
+                        shape = RoundedCornerShape(10.dp),
+                        border = BorderStroke(1.dp, Color(0xFFE2E8F0))
+                    ) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column(modifier = Modifier.weight(1f).padding(end = 8.dp)) {
+                                Text(
+                                    "当前直采目标路径（自动规范化）",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                                Text(
+                                    RuntimeStateStore.shizukuTargetDir,
+                                    style = MaterialTheme.typography.labelSmall,
+                                    fontFamily = FontFamily.Monospace,
+                                    color = Color(0xFF1D4ED8),
+                                    maxLines = 2,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                            }
+                            OutlinedButton(
+                                onClick = {
+                                    launchNativeFilePicker(RuntimeStateStore.shizukuTargetDir) { picked ->
+                                        RuntimeStateStore.updateSettings(context, shizukuTarget = picked)
+                                        DownloadMonitorService.reloadIfRunning(context)
+                                    }
+                                },
+                                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp)
+                            ) {
+                                Text("文档选择器", style = MaterialTheme.typography.labelMedium)
+                            }
+                        }
                     }
                     Text(
                         "当前状态：${ShizukuPrivateDirBridge.statusText}",
@@ -3550,19 +4403,20 @@ private fun SettingsManageTab(
                         }
                         OutlinedButton(
                             onClick = {
+                                val targetPath = NativeDirectoryPicker.normalizeCanonicalPath(RuntimeStateStore.shizukuTargetDir)
                                 val openDocs = Intent(
                                     context,
                                     app.fileroute.ui.OpenSourceFolderActivity::class.java
                                 ).apply {
-                                    putExtra(DownloadMonitorService.EXTRA_SOURCE_PATH, "/storage/emulated/0/Documents/")
+                                    putExtra(DownloadMonitorService.EXTRA_SOURCE_PATH, targetPath)
                                     addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                                 }
                                 runCatching { context.startActivity(openDocs) }.onFailure {
-                                    Toast.makeText(context, "目标路径：/storage/emulated/0/Documents/", Toast.LENGTH_LONG).show()
+                                    Toast.makeText(context, "目标路径：$targetPath", Toast.LENGTH_LONG).show()
                                 }
                             }
                         ) {
-                            Text("打开 Documents")
+                            Text("打开目标目录")
                         }
                     }
 
@@ -3653,6 +4507,29 @@ private fun SettingsManageTab(
                 }
             }
         }
+    }
+
+    if (fallbackBrowserInitialPath != null) {
+        val initPath = fallbackBrowserInitialPath!!
+        val onConfirmCb = fallbackBrowserCallback
+        app.fileroute.ui.FolderBrowserDialog(
+            initialPath = initPath,
+            onDismiss = {
+                fallbackBrowserInitialPath = null
+                fallbackBrowserCallback = null
+            },
+            onConfirm = { picked ->
+                val normalized = NativeDirectoryPicker.normalizeCanonicalPath(picked)
+                onConfirmCb?.invoke(normalized)
+                fallbackBrowserInitialPath = null
+                fallbackBrowserCallback = null
+                Toast.makeText(
+                    context,
+                    "已选定规范路径：$normalized",
+                    Toast.LENGTH_SHORT
+                ).show()
+            }
+        )
     }
 
     if (confirmReset) {

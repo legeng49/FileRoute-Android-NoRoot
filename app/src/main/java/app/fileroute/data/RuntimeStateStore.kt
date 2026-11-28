@@ -39,6 +39,8 @@ object RuntimeStateStore {
     private const val KEY_SAF_TREE_URIS = "saf_tree_uris"
     private const val KEY_SHIZUKU_ENABLED = "shizuku_enabled"
     private const val KEY_SHIZUKU_AUTO_MOVE_DOCS = "shizuku_auto_move_docs"
+    private const val KEY_SHIZUKU_TARGET_DIR = "shizuku_target_dir"
+    private const val KEY_STALE_CLEANUP_30D = "stale_cleanup_30d_enabled"
 
     private val mainHandler = Handler(Looper.getMainLooper())
 
@@ -75,7 +77,9 @@ object RuntimeStateStore {
     var ignoredUpdateTag by mutableStateOf("")
     var quickSilentShareArchive by mutableStateOf(false)
     var shizukuEnabled by mutableStateOf(true)
-    var shizukuAutoMoveToDocuments by mutableStateOf(true)
+    var shizukuAutoMoveToDocuments by mutableStateOf(false)
+    var shizukuTargetDir by mutableStateOf("/storage/emulated/0/Documents/")
+    var staleCleanup30dEnabled by mutableStateOf(false)
 
     private val handledKeys = linkedSetOf<String>()
 
@@ -99,7 +103,12 @@ object RuntimeStateStore {
         ignoredUpdateTag = prefs.getString(KEY_IGNORED_UPDATE_TAG, "") ?: ""
         quickSilentShareArchive = prefs.getBoolean(KEY_QUICK_SILENT_SHARE, false)
         shizukuEnabled = prefs.getBoolean(KEY_SHIZUKU_ENABLED, true)
-        shizukuAutoMoveToDocuments = prefs.getBoolean(KEY_SHIZUKU_AUTO_MOVE_DOCS, true)
+        shizukuAutoMoveToDocuments = prefs.getBoolean(KEY_SHIZUKU_AUTO_MOVE_DOCS, false)
+        shizukuTargetDir = DefaultRuleRepository.ensureTrailingSlash(
+            prefs.getString(KEY_SHIZUKU_TARGET_DIR, "/storage/emulated/0/Documents/")
+                ?.takeIf { it.isNotBlank() } ?: "/storage/emulated/0/Documents/"
+        )
+        staleCleanup30dEnabled = prefs.getBoolean(KEY_STALE_CLEANUP_30D, false)
 
         safTreeUris.clear()
         prefs.getStringSet(KEY_SAF_TREE_URIS, emptySet())?.let { safTreeUris.addAll(it) }
@@ -485,6 +494,57 @@ object RuntimeStateStore {
         }
     }
 
+    fun updateQuickFolderPath(
+        context: Context,
+        index: Int,
+        newPath: String,
+        newLabel: String? = null
+    ): Boolean {
+        ensureInit(context)
+        if (index !in quickFolders.indices) return false
+        val normalized = DefaultRuleRepository.ensureTrailingSlash(newPath.trim())
+        if (normalized.isBlank()) return false
+        val current = quickFolders[index]
+        val finalLabel = newLabel?.trim()?.takeIf { it.isNotEmpty() } ?: current.label
+        quickFolders[index] = current.copy(label = finalLabel, path = normalized)
+        saveQuickFolders(context)
+        appendLog("已通过文档选择器更新常用目录【$finalLabel】：$normalized")
+        return true
+    }
+
+    fun addQuickFolder(
+        context: Context,
+        label: String,
+        path: String,
+        description: String = "系统文档选择器添加"
+    ) {
+        ensureInit(context)
+        val normalized = DefaultRuleRepository.ensureTrailingSlash(path.trim())
+        if (normalized.isBlank()) return
+        val existingIdx = quickFolders.indexOfFirst {
+            DefaultRuleRepository.ensureTrailingSlash(it.path).equals(normalized, ignoreCase = true)
+        }
+        val cleanLabel = label.trim().ifBlank {
+            normalized.trimEnd('/').substringAfterLast('/').ifBlank { "自定义目录" }
+        }
+        if (existingIdx >= 0) {
+            quickFolders[existingIdx] = quickFolders[existingIdx].copy(label = cleanLabel, path = normalized)
+        } else {
+            quickFolders.add(QuickFolder(cleanLabel, normalized, description))
+        }
+        saveQuickFolders(context)
+        appendLog("已添加常用目标目录【$cleanLabel】：$normalized")
+    }
+
+    fun removeQuickFolder(context: Context, index: Int): Boolean {
+        ensureInit(context)
+        if (index !in quickFolders.indices) return false
+        val removed = quickFolders.removeAt(index)
+        saveQuickFolders(context)
+        appendLog("已移除常用目录【${removed.label}】")
+        return true
+    }
+
     fun updateSettings(
         context: Context,
         universal: Boolean = universalScanEnabled,
@@ -501,7 +561,9 @@ object RuntimeStateStore {
         updateRepo: String = githubUpdateRepo,
         quickSilentShare: Boolean = quickSilentShareArchive,
         shizuku: Boolean = shizukuEnabled,
-        shizukuAutoMoveDocs: Boolean = shizukuAutoMoveToDocuments
+        shizukuAutoMoveDocs: Boolean = shizukuAutoMoveToDocuments,
+        shizukuTarget: String = shizukuTargetDir,
+        staleCleanup30d: Boolean = staleCleanup30dEnabled
     ) {
         ensureInit(context)
         universalScanEnabled = universal
@@ -519,6 +581,10 @@ object RuntimeStateStore {
         quickSilentShareArchive = quickSilentShare
         shizukuEnabled = shizuku
         shizukuAutoMoveToDocuments = shizukuAutoMoveDocs
+        shizukuTargetDir = DefaultRuleRepository.ensureTrailingSlash(
+            shizukuTarget.trim().ifBlank { "/storage/emulated/0/Documents/" }
+        )
+        staleCleanup30dEnabled = staleCleanup30d
         context.applicationContext.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
             .edit()
             .putBoolean(KEY_UNIVERSAL_SCAN, universal)
@@ -536,6 +602,8 @@ object RuntimeStateStore {
             .putBoolean(KEY_QUICK_SILENT_SHARE, quickSilentShare)
             .putBoolean(KEY_SHIZUKU_ENABLED, shizuku)
             .putBoolean(KEY_SHIZUKU_AUTO_MOVE_DOCS, shizukuAutoMoveDocs)
+            .putString(KEY_SHIZUKU_TARGET_DIR, shizukuTargetDir)
+            .putBoolean(KEY_STALE_CLEANUP_30D, staleCleanup30d)
             .apply()
     }
 
@@ -958,7 +1026,8 @@ object RuntimeStateStore {
             powerMode = "event_triggered",
             writeCheck = true,
             coalesceBatch = true,
-            verifyDelayMs = 1500L
+            verifyDelayMs = 1500L,
+            shizukuTarget = "/storage/emulated/0/Documents/"
         )
         appendLog("已恢复默认预设规则与触发式唤醒配置")
     }
@@ -972,6 +1041,41 @@ object RuntimeStateStore {
             rules.add(updated)
         }
         saveCustomRules(context)
+    }
+
+    fun updateRuleTargetDir(context: Context, ruleId: String, newTargetDir: String): Boolean {
+        ensureInit(context)
+        val idx = rules.indexOfFirst { it.id == ruleId }
+        if (idx < 0) return false
+        val normalized = DefaultRuleRepository.ensureTrailingSlash(newTargetDir.trim())
+        if (normalized.isBlank()) return false
+        val current = rules[idx]
+        rules[idx] = current.copy(defaultTargetDir = normalized)
+        saveCustomRules(context)
+        appendLog("已通过文档选择器更新【${current.appName}】目标目录：$normalized")
+        return true
+    }
+
+    fun updateRuleSubRuleTargetDir(
+        context: Context,
+        ruleId: String,
+        subRuleIndex: Int,
+        newTargetDir: String
+    ): Boolean {
+        ensureInit(context)
+        val idx = rules.indexOfFirst { it.id == ruleId }
+        if (idx < 0) return false
+        val current = rules[idx]
+        if (subRuleIndex !in current.subRules.indices) return false
+        val normalized = DefaultRuleRepository.ensureTrailingSlash(newTargetDir.trim())
+        if (normalized.isBlank()) return false
+        val updatedSubs = current.subRules.mapIndexed { i, sub ->
+            if (i == subRuleIndex) sub.copy(targetDir = normalized) else sub
+        }
+        rules[idx] = current.copy(subRules = updatedSubs)
+        saveCustomRules(context)
+        appendLog("已更新【${current.appName} · ${current.subRules[subRuleIndex].label}】目标目录：$normalized")
+        return true
     }
 
     /**

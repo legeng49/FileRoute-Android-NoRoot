@@ -70,21 +70,23 @@ class DownloadMonitorService : Service() {
         }
     }
 
-    // 自适应 Shizuku 私有目录轻量巡检：亮屏 2.5 秒实时捕获微信聊天 PDF 下载，灭屏自动降频至 12 秒省电
+    // 自适应 Shizuku 私有目录增量巡检：亮屏 1.5 秒实时捕获微信聊天新下载并弹窗，灭屏自动降频至 10 秒省电
     private val shizukuPollTask: Runnable = object : Runnable {
         override fun run() {
             if (RuntimeStateStore.shizukuEnabled && ShizukuPrivateDirBridge.isReady()) {
                 ioExecutor.execute {
                     DownloadDiscoveryEngine.scanShizukuPrivateDirs(
                         context = applicationContext,
-                        cutoffMillis = System.currentTimeMillis() - 10 * 60_000L,
-                        notifyUser = true
+                        cutoffMillis = 0L,
+                        notifyUser = true,
+                        includeAlreadyHandledInPending = false,
+                        skipStabilityDebounce = false
                     )
                 }
             }
             val pm = getSystemService(POWER_SERVICE) as? PowerManager
             val interactive = pm?.isInteractive ?: true
-            val nextDelay = if (interactive) 2500L else 12000L
+            val nextDelay = if (interactive) 1500L else 10000L
             mainHandler.postDelayed(this, nextDelay)
         }
     }

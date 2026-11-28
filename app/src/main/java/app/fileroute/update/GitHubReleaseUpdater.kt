@@ -32,8 +32,8 @@ object GitHubReleaseUpdater {
     fun getCurrentVersionName(context: Context): String {
         return runCatching {
             val info = context.packageManager.getPackageInfo(context.packageName, 0)
-            info.versionName ?: "3.2.1-android17"
-        }.getOrDefault("3.2.1-android17")
+            info.versionName ?: "3.3.0-android17"
+        }.getOrDefault("3.3.0-android17")
     }
 
     fun normalizeRepo(raw: String): String {

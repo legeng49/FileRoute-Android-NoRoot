@@ -6,12 +6,16 @@ import android.os.Bundle
 import android.provider.OpenableColumns
 import android.widget.Toast
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
@@ -145,8 +149,18 @@ class ShareReceiverActivity : ComponentActivity() {
         setContent {
             MaterialTheme {
                 var selectedDir by remember { mutableStateOf(initialSuggested) }
+                var showFolderBrowser by remember { mutableStateOf(false) }
                 var copyOnly by remember { mutableStateOf(sharedUris.isNotEmpty()) }
                 var conflictStrategy by remember { mutableStateOf("rename_timestamp") }
+                val systemFolderLauncher = rememberLauncherForActivityResult(
+                    ActivityResultContracts.OpenDocumentTree()
+                ) { treeUri ->
+                    val resolved = safTreeUriToRealPath(treeUri)
+                    if (!resolved.isNullOrBlank()) {
+                        selectedDir = resolved
+                        Toast.makeText(this@ShareReceiverActivity, "已选择目录：$resolved", Toast.LENGTH_SHORT).show()
+                    }
+                }
                 val existingConflict = remember(selectedDir, primaryName) {
                     DownloadDiscoveryEngine.findExistingConflict(selectedDir, primaryName)
                 }
@@ -169,12 +183,25 @@ class ShareReceiverActivity : ComponentActivity() {
                     DownloadDiscoveryEngine.buildTimestampedFileName(primaryName)
                 }
 
+                if (showFolderBrowser) {
+                    FolderBrowserDialog(
+                        initialPath = selectedDir,
+                        onDismiss = { showFolderBrowser = false },
+                        onConfirm = { picked ->
+                            selectedDir = picked
+                            showFolderBrowser = false
+                        },
+                        onOpenSystemPicker = { systemFolderLauncher.launch(null) }
+                    )
+                }
+
                 ModalBottomSheet(onDismissRequest = { finish() }) {
                     Column(
                         modifier = Modifier
                             .fillMaxWidth()
+                            .verticalScroll(rememberScrollState())
                             .padding(horizontal = 20.dp, vertical = 12.dp),
-                        verticalArrangement = Arrangement.spacedBy(14.dp)
+                        verticalArrangement = Arrangement.spacedBy(12.dp)
                     ) {
                         Text(text = "选择文件归位目录", style = MaterialTheme.typography.titleLarge)
                         Text(
@@ -183,10 +210,28 @@ class ShareReceiverActivity : ComponentActivity() {
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
 
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            FilledTonalButton(
+                                onClick = { showFolderBrowser = true },
+                                modifier = Modifier.weight(1f)
+                            ) {
+                                Text("浏览文件夹...")
+                            }
+                            OutlinedButton(
+                                onClick = { systemFolderLauncher.launch(null) },
+                                modifier = Modifier.weight(1f)
+                            ) {
+                                Text("系统文件管理器")
+                            }
+                        }
+
                         OutlinedTextField(
                             value = selectedDir,
                             onValueChange = { selectedDir = it },
-                            label = { Text("目标存储目录") },
+                            label = { Text("目标存储目录（支持点击上方直接选取）") },
                             modifier = Modifier.fillMaxWidth(),
                             singleLine = true
                         )

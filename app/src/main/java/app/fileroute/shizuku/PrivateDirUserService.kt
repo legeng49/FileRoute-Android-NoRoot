@@ -37,25 +37,36 @@ class PrivateDirUserService : IPrivateDirService.Stub {
 
     private val skipDirNames = setOf(
         "image", "image2", "avatar", "voice", "voice2", "video", "sfs", "sns",
-        "emoji", "webview", "xweb", "cache", "wxacache", "appbrand", "brandicon",
+        "emoji", "webview", "xweb", "wxacache", "appbrand", "brandicon",
         "checkresupdate", "crash", "xlog", "tinker", "fts", "tmp", "temp",
-        "finder", "live", "biz", "bizimg", "favorite", "vusericon", "wallet",
-        "package", "game", "miniprogram", "webcompt", "flutter"
+        "finder", "live", "bizimg", "favorite", "vusericon", "wallet",
+        "package", "game", "miniprogram", "webcompt", "flutter", "matrix",
+        "voip", "ilink", "wxa", "pag", "res", "dex", "oat"
     )
 
-    private val hexAccountRegex = Regex("^[0-9a-fA-F]{24,40}$")
+    private val strictCacheUserExtensions = setOf(
+        "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "wps", "et", "dps",
+        "txt", "md", "csv", "rtf", "epub", "mobi", "azw3", "caj", "ofd", "pages",
+        "zip", "rar", "7z", "tar", "gz", "bz2", "xz", "apk", "apks", "xapk",
+        "mp4", "mkv", "mov", "avi", "mp3", "m4a", "wav", "flac", "dwg", "psd", "ai"
+    )
+
+    private val hexAccountRegex = Regex("^[0-9a-fA-F]{16,40}$")
 
     override fun destroy() {
         exitProcess(0)
     }
 
-    private fun expandWeChatAndChatDirs(inputDirs: Array<out String>?): List<File> {
-        val expanded = linkedMapOf<String, File>()
+    private fun expandWeChatAndChatDirs(inputDirs: Array<out String>?): List<Pair<File, Boolean>> {
+        val expanded = linkedMapOf<String, Pair<File, Boolean>>()
 
-        fun addIfDir(dir: File) {
+        fun addIfDir(dir: File, strictDocOnly: Boolean = false) {
             runCatching {
                 if (dir.exists() && dir.isDirectory) {
-                    expanded[dir.absolutePath] = dir
+                    val existing = expanded[dir.absolutePath]
+                    if (existing == null || (existing.second && !strictDocOnly)) {
+                        expanded[dir.absolutePath] = dir to strictDocOnly
+                    }
                 }
             }
         }
@@ -65,24 +76,35 @@ class PrivateDirUserService : IPrivateDirService.Stub {
             addIfDir(File(microMsgDir, "Download"))
             addIfDir(File(microMsgDir, "WeiXin"))
             addIfDir(File(microMsgDir, "attachment"))
+            addIfDir(File(microMsgDir, "attachment2"))
 
-            val children = microMsgDir.listFiles() ?: return
+            val children = runCatching { microMsgDir.listFiles() }.getOrNull() ?: return
             for (child in children) {
                 if (!child.isDirectory) continue
                 val lower = child.name.lowercase(Locale.ROOT)
                 if (lower in skipDirNames || lower.startsWith(".")) continue
-                // 微信 8.0+ 为每个登录账号生成 32 位 hex 目录，聊天点击下载的 PDF/Word/PPT 存在 <hash>/attachment 下
+                // 微信 8.0+ / 平板 HD 版在 32 位账号哈希目录下使用 attachment / attachment2 / Download / openapi / record / file
                 if (hexAccountRegex.matches(child.name) || child.name.length >= 16) {
                     addIfDir(File(child, "attachment"))
+                    addIfDir(File(child, "attachment2"))
                     addIfDir(File(child, "openapi"))
                     addIfDir(File(child, "record"))
                     addIfDir(File(child, "Download"))
                     addIfDir(File(child, "file"))
+                    addIfDir(File(child, "files"))
                 }
             }
         }
 
         val storageRoots = linkedSetOf("/storage/emulated/0")
+        runCatching {
+            val emulatedBase = File("/storage/emulated")
+            emulatedBase.listFiles()?.forEach { userDir ->
+                if (userDir.isDirectory && userDir.name.all { it.isDigit() }) {
+                    storageRoots.add(userDir.absolutePath)
+                }
+            }
+        }
         val dualAppRoot = File("/storage/emulated/999")
         if (dualAppRoot.exists() && dualAppRoot.isDirectory) {
             storageRoots.add("/storage/emulated/999")
@@ -92,6 +114,9 @@ class PrivateDirUserService : IPrivateDirService.Stub {
             expandMicroMsgRoot(File("$root/Android/data/com.tencent.mm/MicroMsg"))
             addIfDir(File("$root/Android/data/com.tencent.mm/files/Download"))
             addIfDir(File("$root/Android/data/com.tencent.mm/files/attachment"))
+            addIfDir(File("$root/Android/data/com.tencent.mm/files/WeiXin"))
+            addIfDir(File("$root/Android/data/com.tencent.mm/files"), strictDocOnly = true)
+            addIfDir(File("$root/Android/data/com.tencent.mm/cache"), strictDocOnly = true)
             addIfDir(File("$root/Download/WeiXin"))
             addIfDir(File("$root/Documents/WeiXin"))
             addIfDir(File("$root/Tencent/MicroMsg/Download"))
@@ -121,13 +146,21 @@ class PrivateDirUserService : IPrivateDirService.Stub {
         val seen = hashSetOf<String>()
         val items = ArrayList<JSONObject>()
 
-        for (root in dirs) {
-            walkDir(root, sinceEpochMs, depth = 0, maxDepth = 3, seen = seen, out = items)
+        for ((root, strictDocOnly) in dirs) {
+            walkDir(
+                dir = root,
+                sinceEpochMs = sinceEpochMs,
+                depth = 0,
+                maxDepth = 5,
+                strictDocOnly = strictDocOnly,
+                seen = seen,
+                out = items
+            )
         }
 
         items.sortByDescending { it.optLong("lastModified", 0L) }
         val result = JSONArray()
-        val limit = items.size.coerceAtMost(200)
+        val limit = items.size.coerceAtMost(400)
         for (i in 0 until limit) {
             result.put(items[i])
         }
@@ -137,14 +170,20 @@ class PrivateDirUserService : IPrivateDirService.Stub {
     override fun diagnoseWeChatDirsJson(baseRoots: Array<out String>?): String {
         val dirs = expandWeChatAndChatDirs(baseRoots)
         val arr = JSONArray()
-        for (dir in dirs) {
-            var fileCount = 0
+        for ((dir, strictDocOnly) in dirs) {
             var newestName = ""
             var newestMod = 0L
             val seen = hashSetOf<String>()
             val bucket = ArrayList<JSONObject>()
-            walkDir(dir, sinceEpochMs = 0L, depth = 0, maxDepth = 3, seen = seen, out = bucket)
-            fileCount = bucket.size
+            walkDir(
+                dir = dir,
+                sinceEpochMs = 0L,
+                depth = 0,
+                maxDepth = 5,
+                strictDocOnly = strictDocOnly,
+                seen = seen,
+                out = bucket
+            )
             for (obj in bucket) {
                 val mod = obj.optLong("lastModified", 0L)
                 if (mod > newestMod) {
@@ -155,7 +194,7 @@ class PrivateDirUserService : IPrivateDirService.Stub {
             arr.put(
                 JSONObject().apply {
                     put("dirPath", dir.absolutePath)
-                    put("fileCount", fileCount)
+                    put("fileCount", bucket.size)
                     put("latestFileName", newestName)
                     put("latestModified", newestMod)
                 }
@@ -169,6 +208,7 @@ class PrivateDirUserService : IPrivateDirService.Stub {
         sinceEpochMs: Long,
         depth: Int,
         maxDepth: Int,
+        strictDocOnly: Boolean,
         seen: MutableSet<String>,
         out: MutableList<JSONObject>
     ) {
@@ -179,7 +219,7 @@ class PrivateDirUserService : IPrivateDirService.Stub {
             if (child.isDirectory) {
                 if (name.lowercase(Locale.ROOT) in skipDirNames) continue
                 if (depth < maxDepth) {
-                    walkDir(child, sinceEpochMs, depth + 1, maxDepth, seen, out)
+                    walkDir(child, sinceEpochMs, depth + 1, maxDepth, strictDocOnly, seen, out)
                 }
             } else if (child.isFile) {
                 val len = child.length()
@@ -188,6 +228,7 @@ class PrivateDirUserService : IPrivateDirService.Stub {
                 val ext = name.substringAfterLast('.', "").lowercase(Locale.ROOT)
                 // 微信缓存里无后缀的内部数据库/缩略图文件直接跳过，仅保留带正常文件后缀的用户文档/压缩包/媒体/安装包
                 if (ext.isEmpty() || ext in ignoredExtensions) continue
+                if (strictDocOnly && ext !in strictCacheUserExtensions) continue
                 val abs = child.absolutePath
                 if (seen.add(abs)) {
                     out.add(

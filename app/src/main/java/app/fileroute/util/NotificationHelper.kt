@@ -13,6 +13,7 @@ import android.os.VibrationAttributes
 import android.os.VibrationEffect
 import android.os.Vibrator
 import android.os.VibratorManager
+import android.provider.Settings
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import app.fileroute.service.DownloadMonitorService
@@ -23,6 +24,14 @@ import java.io.File
 object NotificationHelper {
     const val CHANNEL_KEEPALIVE = "fileroute_keepalive"
     const val CHANNEL_ALERT = "fileroute_new_file_alert"
+
+    fun canDrawOverlays(context: Context): Boolean {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            runCatching { Settings.canDrawOverlays(context) }.getOrDefault(false)
+        } else {
+            true
+        }
+    }
 
     fun hasNotificationPermission(context: Context): Boolean {
         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -72,10 +81,10 @@ object NotificationHelper {
         context: Context,
         appName: String,
         file: File,
-        suggestedDir: String
+        suggestedDir: String,
+        autoPopupIfAllowed: Boolean = true
     ): Boolean {
         ensureChannels(context)
-        if (!hasNotificationPermission(context)) return false
 
         val intent = Intent(context, ShareReceiverActivity::class.java).apply {
             flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP
@@ -83,6 +92,18 @@ object NotificationHelper {
             putExtra(DownloadMonitorService.EXTRA_APP_NAME, appName)
             putExtra(DownloadMonitorService.EXTRA_SUGGESTED_DIR, suggestedDir)
         }
+
+        // 若已授予「悬浮窗/显示在其他应用上层」权限，Android 10-17 允许从后台直接弹出透明底部目录选择框，
+        // 在微信聊天页点击下载后无需下拉通知栏即可直接修改转存地址！
+        var poppedDirectly = false
+        if (autoPopupIfAllowed && canDrawOverlays(context)) {
+            poppedDirectly = runCatching {
+                context.applicationContext.startActivity(intent)
+                true
+            }.getOrDefault(false)
+        }
+
+        if (!hasNotificationPermission(context)) return poppedDirectly
 
         val requestCode = file.absolutePath.hashCode()
         val pi = PendingIntent.getActivity(
@@ -107,7 +128,7 @@ object NotificationHelper {
         val notification = NotificationCompat.Builder(context, CHANNEL_ALERT)
             .setSmallIcon(android.R.drawable.stat_sys_download_done)
             .setContentTitle("检测到 $appName 新下载文件")
-            .setContentText("${file.name} · 点击选择目标目录归位")
+            .setContentText("${file.name} · 点击修改转存目录")
             .setStyle(
                 NotificationCompat.BigTextStyle()
                     .bigText("${file.name}\n源目录：${sourceDirPath}\n建议归位 → $suggestedDir")
@@ -117,11 +138,12 @@ object NotificationHelper {
             .setDefaults(NotificationCompat.DEFAULT_ALL)
             .setAutoCancel(true)
             .setContentIntent(pi)
-            .addAction(0, "选择目录归位", pi)
+            .setFullScreenIntent(pi, false)
+            .addAction(0, "修改转存地址", pi)
             .addAction(0, "打开源文件夹", openFolderPi)
             .build()
 
-        val nm = context.getSystemService(NotificationManager::class.java) ?: return false
+        val nm = context.getSystemService(NotificationManager::class.java) ?: return poppedDirectly
         nm.notify(requestCode, notification)
         return true
     }

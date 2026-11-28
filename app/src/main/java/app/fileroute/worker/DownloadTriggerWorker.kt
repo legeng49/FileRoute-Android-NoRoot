@@ -94,6 +94,9 @@ class BootTriggerReceiver : BroadcastReceiver() {
             if (RuntimeStateStore.guardArmed) {
                 DownloadTriggerWorker.scheduleNextTrigger(context)
             }
+            if (RuntimeStateStore.staleCleanup30dEnabled) {
+                StaleFileCleanupWorker.syncSchedule(context, true)
+            }
         }
     }
 }

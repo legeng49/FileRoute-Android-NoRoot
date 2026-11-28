@@ -117,12 +117,25 @@ object ShizukuPrivateDirBridge {
                 remoteService = IPrivateDirService.Stub.asInterface(service)
                 mainHandler.post {
                     serviceBound = true
-                    statusText = "Shizuku 已就绪 · 微信 MicroMsg/attachment 实时监听可用"
+                    statusText = "Shizuku 已就绪 · 微信聊天实时监听运行中"
                 }
-                RuntimeStateStore.appendLog("Shizuku UserService 绑定成功，已覆盖微信 MicroMsg/<账号>/attachment 与 Download 目录")
+                RuntimeStateStore.appendLog("Shizuku UserService 绑定成功，已建立微信聊天目录实时快照监听")
                 appContext?.let { ctx ->
-                    // 若已开启守护，立即拉起前台守护以启动 2.5 秒微信私有目录实时巡检
-                    if (RuntimeStateStore.guardArmed) {
+                    // 先对已有旧文件建立基线快照，避免启动瞬间对历史旧文件误弹窗；同时将最近下载列入待归位队列
+                    bgExecutor.execute {
+                        val baselineCount = DownloadDiscoveryEngine.seedShizukuBaseline(ctx)
+                        RuntimeStateStore.appendLog("Shizuku 微信目录基线已建立（已索引 $baselineCount 个既有文件），此后任何新点击下载将秒级触发弹窗")
+                        DownloadDiscoveryEngine.scanShizukuPrivateDirs(
+                            context = ctx,
+                            cutoffMillis = System.currentTimeMillis() - 7L * 24 * 60 * 60_000L,
+                            notifyUser = false,
+                            includeAlreadyHandledInPending = true,
+                            skipStabilityDebounce = true
+                        )
+                    }
+                    // 只要已授予所有文件访问权限，绑定 Shizuku 后自动拉起前台实时守护，确保微信聊天点击下载即可秒级捕获
+                    if (DownloadDiscoveryEngine.hasAllFilesAccess()) {
+                        RuntimeStateStore.updateSettings(ctx, armed = true)
                         runCatching {
                             val svcIntent = Intent(ctx, DownloadMonitorService::class.java)
                             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -131,16 +144,6 @@ object ShizukuPrivateDirBridge {
                                 ctx.startService(svcIntent)
                             }
                         }
-                    }
-                    // 绑定成功后立刻后台扫描近 7 天微信聊天文件，方便用户第一时间在待归位队列中看到
-                    bgExecutor.execute {
-                        DownloadDiscoveryEngine.scanShizukuPrivateDirs(
-                            context = ctx,
-                            cutoffMillis = System.currentTimeMillis() - 7L * 24 * 60 * 60_000L,
-                            notifyUser = false,
-                            includeAlreadyHandledInPending = true,
-                            skipStabilityDebounce = true
-                        )
                     }
                 }
             }
@@ -186,12 +189,16 @@ object ShizukuPrivateDirBridge {
         } else {
             false
         }
+        // 关键修复：若用户已在 Shizuku 管理器中直接手动打开了本应用授权，自动同步开启 shizukuEnabled 并立即绑定！
+        if (alive && granted && !RuntimeStateStore.shizukuEnabled) {
+            RuntimeStateStore.updateSettings(app, shizuku = true)
+        }
         val bound = alive && granted && remoteService != null
         val summary = when {
             !installed -> "未安装 Shizuku（当前自动运行零 Shizuku 公共目录模式）"
             !alive -> "已安装 Shizuku，但服务未启动（请先在 Shizuku 中开启无线调试）"
             !granted -> "Shizuku 运行中 · 点击「授权 Shizuku」即可开启微信聊天直采"
-            bound -> "Shizuku 已就绪 · 微信 MicroMsg/attachment 实时监听可用"
+            bound -> "Shizuku 已就绪 · 微信聊天实时监听运行中"
             else -> "Shizuku 已授权 · 正在连接私有目录通道"
         }
         mainHandler.post {
@@ -212,6 +219,7 @@ object ShizukuPrivateDirBridge {
         if (runCatching { Shizuku.isPreV11() }.getOrDefault(true)) return false
         if (runCatching { Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED }.getOrDefault(false)) {
             permissionGranted = true
+            RuntimeStateStore.updateSettings(context, shizuku = true)
             bindService(context)
             return true
         }
@@ -230,7 +238,7 @@ object ShizukuPrivateDirBridge {
             val verCode = runCatching {
                 val pi = app.packageManager.getPackageInfo(app.packageName, 0)
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) pi.longVersionCode.toInt() else @Suppress("DEPRECATION") pi.versionCode
-            }.getOrDefault(8)
+            }.getOrDefault(9)
             val args = userServiceArgs ?: Shizuku.UserServiceArgs(
                 ComponentName(app.packageName, PrivateDirUserService::class.java.name)
             )

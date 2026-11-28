@@ -25,11 +25,31 @@ import java.io.FileOutputStream
 import java.net.URLDecoder
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicBoolean
 
 object DownloadDiscoveryEngine {
 
     private val IGNORED_EXTENSIONS = setOf("tmp", "crdownload", "part", "download", "pending", "bak")
     private val shizukuStabilityMap = ConcurrentHashMap<String, Pair<Long, Long>>()
+    private val shizukuKnownSizes = ConcurrentHashMap<String, Long>()
+    private val shizukuBaselineReady = AtomicBoolean(false)
+
+    /**
+     * 建立微信/QQ 私有目录文件基线快照：
+     * 记录启动前已经存在的文件路径与体积，此后只要出现任何新路径或体积增长，
+     * 即使微信保留了发送方旧的 lastModified 时间戳，也能 100% 在 1.5 秒内捕获并弹出目录修改框！
+     */
+    fun seedShizukuBaseline(context: Context): Int {
+        if (!RuntimeStateStore.shizukuEnabled || !ShizukuPrivateDirBridge.isReady()) return 0
+        val entries = ShizukuPrivateDirBridge.scanPrivateChatDirs(context, 0L)
+        for (e in entries) {
+            if (e.path.isNotBlank() && e.size > 0L) {
+                shizukuKnownSizes[e.path] = e.size
+            }
+        }
+        shizukuBaselineReady.set(true)
+        return entries.size
+    }
 
     fun buildWeChatChatSafInitialUri(): Uri {
         return Uri.parse(
@@ -193,7 +213,9 @@ object DownloadDiscoveryEngine {
 
     /**
      * Layer D: 可选 Shizuku 特权通道扫描微信 / QQ / TIM / 钉钉 / 飞书 Android/data 私有聊天目录
-     * （自动覆盖微信 MicroMsg/<账号哈希>/attachment 与 MicroMsg/Download，支持实时直移文件管理器 Documents）
+     * - 实时监听模式（notifyUser = true）：采用快照增量比对（不依赖微信可能偏旧的 lastModified 时间戳），
+     *   只要聊天框内新点击下载任何文件，体积稳定后 1.5 秒内即刻弹出「选择文件归位目录」修改框！
+     * - 手动扫描模式（notifyUser = false）：扫描近 7 天聊天文件列入待归位队列，且不会静默吞掉未处理项。
      */
     fun scanShizukuPrivateDirs(
         context: Context,
@@ -203,11 +225,27 @@ object DownloadDiscoveryEngine {
         skipStabilityDebounce: Boolean = false
     ): Int {
         if (!RuntimeStateStore.shizukuEnabled || !ShizukuPrivateDirBridge.isReady()) return 0
-        val entries = ShizukuPrivateDirBridge.scanPrivateChatDirs(context, cutoffMillis)
+
+        // 实时巡检若尚未初始化基线，先建立快照（同时放行最近 90 秒内刚点击下载的新文件）
+        val isLiveDiffPoll = notifyUser && !skipStabilityDebounce
+        if (isLiveDiffPoll && !shizukuBaselineReady.get()) {
+            val initialEntries = ShizukuPrivateDirBridge.scanPrivateChatDirs(context, 0L)
+            val recentThreshold = System.currentTimeMillis() - 90_000L
+            for (e in initialEntries) {
+                if (e.path.isNotBlank() && e.size > 0L && e.lastModified < recentThreshold) {
+                    shizukuKnownSizes[e.path] = e.size
+                }
+            }
+            shizukuBaselineReady.set(true)
+        }
+
+        val entries = ShizukuPrivateDirBridge.scanPrivateChatDirs(
+            context = context,
+            sinceEpochMs = if (isLiveDiffPoll) 0L else cutoffMillis
+        )
         if (entries.isEmpty()) return 0
 
         val now = System.currentTimeMillis()
-        val verifyDelayMs = RuntimeStateStore.writeVerifyDelayMs.coerceAtLeast(800L)
         var handled = 0
 
         for (entry in entries) {
@@ -216,18 +254,32 @@ object DownloadDiscoveryEngine {
 
             val dedupKey = "${entry.path}|${entry.size}|${entry.lastModified}"
             val alreadyHandled = RuntimeStateStore.isAlreadyHandled(context, dedupKey)
-            if (alreadyHandled && !includeAlreadyHandledInPending) continue
 
-            // 后台自动巡检时做写入稳定性防抖；手动扫描立即放行，确保第一下点击就能看到文件
-            val ageMs = now - entry.lastModified
-            if (!skipStabilityDebounce && ageMs < verifyDelayMs) {
+            if (isLiveDiffPoll) {
+                val knownSize = shizukuKnownSizes[entry.path]
+                // 路径和体积与基线完全一致 => 属于之前已经存在的旧文件，跳过实时弹窗
+                if (knownSize != null && knownSize == entry.size) continue
+                if (alreadyHandled) {
+                    shizukuKnownSizes[entry.path] = entry.size
+                    continue
+                }
+
+                // 单次写入稳定性防抖：若文件仍在下载写入中（体积仍在增长），等下一个 1.5s 周期稳定后再弹窗
                 val prevSeen = shizukuStabilityMap[entry.path]
-                if (prevSeen == null || prevSeen.first != entry.size) {
+                val fileAgeMs = now - entry.lastModified
+                if (prevSeen == null && fileAgeMs in 0L..1200L) {
                     shizukuStabilityMap[entry.path] = entry.size to now
                     continue
                 }
+                if (prevSeen != null && prevSeen.first != entry.size) {
+                    shizukuStabilityMap[entry.path] = entry.size to now
+                    continue
+                }
+                shizukuStabilityMap.remove(entry.path)
+                shizukuKnownSizes[entry.path] = entry.size
+            } else {
+                if (alreadyHandled && !includeAlreadyHandledInPending) continue
             }
-            shizukuStabilityMap.remove(entry.path)
 
             val lowerPath = entry.path.lowercase(Locale.ROOT)
             val inferredPkg = when {
@@ -254,22 +306,17 @@ object DownloadDiscoveryEngine {
                 else -> DefaultRuleRepository.inferAppLabel(entry.path, inferredPkg, matchedRule)
             }
 
-            val documentsRoot = DefaultRuleRepository.ensureTrailingSlash(
-                File(Environment.getExternalStorageDirectory(), Environment.DIRECTORY_DOCUMENTS).absolutePath
-            )
+            val shizukuRoot = NativeDirectoryPicker.normalizeCanonicalPath(RuntimeStateStore.shizukuTargetDir)
             val (resolvedTargetDir, matchedLabel) = DefaultRuleRepository.resolveTargetDir(
                 matchedRule,
                 entry.name,
                 RuntimeStateStore.smartClassifyEnabled,
                 RuntimeStateStore.smartGroupByApp
             )
-            // 若用户开启「聊天文件直移 Documents」，优先直接落盘至文件管理器 Documents 根目录，打开文件管理器即见
-            val targetDir = if (RuntimeStateStore.shizukuAutoMoveToDocuments) documentsRoot else resolvedTargetDir
-            val isFreshDownload = ageMs in 0L..(20 * 60_000L)
+            val targetDir = if (RuntimeStateStore.shizukuAutoMoveToDocuments) shizukuRoot else resolvedTargetDir
             val effectiveAction = when {
-                // 手动扫描旧文件时先放入待归位队列供用户一键移至 Documents，避免未经确认误搬运大量历史聊天文件
-                skipStabilityDebounce -> RouteAction.PROMPT
-                RuntimeStateStore.shizukuAutoMoveToDocuments && isFreshDownload -> RouteAction.AUTO_MOVE
+                !isLiveDiffPoll -> RouteAction.PROMPT
+                RuntimeStateStore.shizukuAutoMoveToDocuments -> RouteAction.AUTO_MOVE
                 else -> matchedRule?.action ?: RouteAction.PROMPT
             }
 
@@ -296,10 +343,11 @@ object DownloadDiscoveryEngine {
                             RuntimeStateStore.markHandled(context, dedupKey)
                             if (notifyUser) {
                                 NotificationHelper.postNewFileHeadsUp(
-                                    context,
-                                    "$appName 已移至 Documents",
-                                    File(targetDir, finalName),
-                                    targetDir
+                                    context = context,
+                                    appName = "$appName 已归位",
+                                    file = File(targetDir, finalName),
+                                    suggestedDir = targetDir,
+                                    autoPopupIfAllowed = false
                                 )
                             }
                             handled++
@@ -319,19 +367,20 @@ object DownloadDiscoveryEngine {
                         detectedAtText = DefaultRuleRepository.nowTimeText()
                     )
                     RuntimeStateStore.addOrUpdatePending(item)
-                    if (!alreadyHandled) {
+                    if (isLiveDiffPoll && !alreadyHandled) {
                         RuntimeStateStore.markHandled(context, dedupKey)
-                        if (notifyUser) {
-                            val posted = NotificationHelper.postNewFileHeadsUp(
-                                context,
-                                appName,
-                                File(entry.path),
-                                targetDir
-                            )
-                            RuntimeStateStore.appendLog(
-                                "Shizuku 捕获 [${appName}] ${entry.name} -> 通知${if (posted) "已弹出" else "未授权被拦截"}"
-                            )
-                        }
+                        val alerted = NotificationHelper.postNewFileHeadsUp(
+                            context = context,
+                            appName = appName,
+                            file = File(entry.path),
+                            suggestedDir = targetDir,
+                            autoPopupIfAllowed = true
+                        )
+                        RuntimeStateStore.appendLog(
+                            "Shizuku 捕获 [${appName}] ${entry.name}（${DefaultRuleRepository.formatSize(entry.size)}）-> ${if (NotificationHelper.canDrawOverlays(context)) "已直接弹出地址选择框" else if (alerted) "已弹出顶部通知横幅" else "请开启悬浮窗/通知权限"}"
+                        )
+                        handled++
+                    } else if (!isLiveDiffPoll && !alreadyHandled) {
                         handled++
                     }
                 }
