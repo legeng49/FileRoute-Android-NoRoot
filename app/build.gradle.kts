@@ -14,13 +14,36 @@ android {
         applicationId = "app.fileroute"
         minSdk = 26
         targetSdk = 37
-        versionCode = 8
-        versionName = "3.2.1-android17"
+        versionCode = 9
+        versionName = "3.2.2-android17"
+    }
+
+    signingConfigs {
+        create("ci") {
+            val storePath = System.getenv("ANDROID_KEYSTORE_PATH")
+            if (!storePath.isNullOrBlank()) {
+                storeFile = file(storePath)
+                storePassword = System.getenv("ANDROID_KEYSTORE_PASSWORD")
+                keyAlias = System.getenv("ANDROID_KEY_ALIAS")
+                keyPassword = System.getenv("ANDROID_KEY_PASSWORD")
+                storeType = "PKCS12"
+            }
+        }
     }
 
     buildTypes {
+        debug {
+            val storePath = System.getenv("ANDROID_KEYSTORE_PATH")
+            if (!storePath.isNullOrBlank()) {
+                signingConfig = signingConfigs.getByName("ci")
+            }
+        }
         release {
             isMinifyEnabled = false
+            val storePath = System.getenv("ANDROID_KEYSTORE_PATH")
+            if (!storePath.isNullOrBlank()) {
+                signingConfig = signingConfigs.getByName("ci")
+            }
         }
     }
 
