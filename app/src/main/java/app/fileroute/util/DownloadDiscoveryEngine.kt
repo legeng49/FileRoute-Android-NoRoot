@@ -1,12 +1,15 @@
 package app.fileroute.util
 
+import android.content.ContentValues
 import android.content.Context
 import android.media.MediaScannerConnection
 import android.net.Uri
 import android.os.Build
 import android.os.Environment
+import android.os.ParcelFileDescriptor
 import android.provider.DocumentsContract
 import android.provider.MediaStore
+import android.webkit.MimeTypeMap
 import app.fileroute.data.ChannelMode
 import app.fileroute.data.DefaultRuleRepository
 import app.fileroute.data.DetectedDownloadItem
@@ -18,6 +21,7 @@ import app.fileroute.data.RuntimeStateStore
 import app.fileroute.data.TransferHistoryItem
 import app.fileroute.shizuku.ShizukuPrivateDirBridge
 import java.io.File
+import java.io.FileOutputStream
 import java.net.URLDecoder
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
@@ -96,7 +100,8 @@ object DownloadDiscoveryEngine {
             context = context,
             cutoffMillis = cutoffMillis,
             notifyUser = notifyUser,
-            includeAlreadyHandledInPending = includeAlreadyHandledInPending
+            includeAlreadyHandledInPending = includeAlreadyHandledInPending,
+            skipStabilityDebounce = !notifyUser
         )
         for ((absPath, pair) in foundMap) {
             val (file, ownerPkg) = pair
@@ -188,13 +193,14 @@ object DownloadDiscoveryEngine {
 
     /**
      * Layer D: 可选 Shizuku 特权通道扫描微信 / QQ / TIM / 钉钉 / 飞书 Android/data 私有聊天目录
-     * （自带落盘大小稳定性防抖，确保聊天中点击下载的 PDF 完全写入后再触发归位或顶部横幅）
+     * （自动覆盖微信 MicroMsg/<账号哈希>/attachment 与 MicroMsg/Download，支持实时直移文件管理器 Documents）
      */
     fun scanShizukuPrivateDirs(
         context: Context,
         cutoffMillis: Long = System.currentTimeMillis() - 15 * 60_000L,
         notifyUser: Boolean = true,
-        includeAlreadyHandledInPending: Boolean = false
+        includeAlreadyHandledInPending: Boolean = false,
+        skipStabilityDebounce: Boolean = false
     ): Int {
         if (!RuntimeStateStore.shizukuEnabled || !ShizukuPrivateDirBridge.isReady()) return 0
         val entries = ShizukuPrivateDirBridge.scanPrivateChatDirs(context, cutoffMillis)
@@ -212,10 +218,10 @@ object DownloadDiscoveryEngine {
             val alreadyHandled = RuntimeStateStore.isAlreadyHandled(context, dedupKey)
             if (alreadyHandled && !includeAlreadyHandledInPending) continue
 
-            // 写入稳定性校验：刚落盘不足防抖时长的文件需等待连续两次大小一致再处理，避免截断未下完的 PDF
-            val prevSeen = shizukuStabilityMap[entry.path]
+            // 后台自动巡检时做写入稳定性防抖；手动扫描立即放行，确保第一下点击就能看到文件
             val ageMs = now - entry.lastModified
-            if (ageMs < verifyDelayMs) {
+            if (!skipStabilityDebounce && ageMs < verifyDelayMs) {
+                val prevSeen = shizukuStabilityMap[entry.path]
                 if (prevSeen == null || prevSeen.first != entry.size) {
                     shizukuStabilityMap[entry.path] = entry.size to now
                     continue
@@ -225,9 +231,9 @@ object DownloadDiscoveryEngine {
 
             val lowerPath = entry.path.lowercase(Locale.ROOT)
             val inferredPkg = when {
-                lowerPath.contains("com.tencent.mm") -> "com.tencent.mm"
-                lowerPath.contains("com.tencent.mobileqq") -> "com.tencent.mobileqq"
-                lowerPath.contains("com.tencent.tim") -> "com.tencent.tim"
+                lowerPath.contains("com.tencent.mm") || lowerPath.contains("micromsg") || lowerPath.contains("weixin") -> "com.tencent.mm"
+                lowerPath.contains("com.tencent.mobileqq") || lowerPath.contains("qqfile_recv") -> "com.tencent.mobileqq"
+                lowerPath.contains("com.tencent.tim") || lowerPath.contains("timfile_recv") -> "com.tencent.tim"
                 lowerPath.contains("com.alibaba.android.rimet") -> "com.alibaba.android.rimet"
                 lowerPath.contains("com.ss.android.lark") -> "com.ss.android.lark"
                 else -> null
@@ -248,18 +254,29 @@ object DownloadDiscoveryEngine {
                 else -> DefaultRuleRepository.inferAppLabel(entry.path, inferredPkg, matchedRule)
             }
 
-            val (targetDir, matchedLabel) = DefaultRuleRepository.resolveTargetDir(
+            val documentsRoot = DefaultRuleRepository.ensureTrailingSlash(
+                File(Environment.getExternalStorageDirectory(), Environment.DIRECTORY_DOCUMENTS).absolutePath
+            )
+            val (resolvedTargetDir, matchedLabel) = DefaultRuleRepository.resolveTargetDir(
                 matchedRule,
                 entry.name,
                 RuntimeStateStore.smartClassifyEnabled,
                 RuntimeStateStore.smartGroupByApp
             )
-            val action = matchedRule?.action ?: RouteAction.PROMPT
+            // 若用户开启「聊天文件直移 Documents」，优先直接落盘至文件管理器 Documents 根目录，打开文件管理器即见
+            val targetDir = if (RuntimeStateStore.shizukuAutoMoveToDocuments) documentsRoot else resolvedTargetDir
+            val isFreshDownload = ageMs in 0L..(20 * 60_000L)
+            val effectiveAction = when {
+                // 手动扫描旧文件时先放入待归位队列供用户一键移至 Documents，避免未经确认误搬运大量历史聊天文件
+                skipStabilityDebounce -> RouteAction.PROMPT
+                RuntimeStateStore.shizukuAutoMoveToDocuments && isFreshDownload -> RouteAction.AUTO_MOVE
+                else -> matchedRule?.action ?: RouteAction.PROMPT
+            }
 
-            when (action) {
+            when (effectiveAction) {
                 RouteAction.AUTO_MOVE, RouteAction.AUTO_COPY -> {
                     if (!alreadyHandled) {
-                        val copyOnly = action == RouteAction.AUTO_COPY
+                        val copyOnly = effectiveAction == RouteAction.AUTO_COPY
                         val finalName = DefaultRuleRepository.formatFileName(
                             matchedRule?.renamePattern ?: "{name}",
                             appName,
@@ -277,6 +294,14 @@ object DownloadDiscoveryEngine {
                         )
                         if (ok) {
                             RuntimeStateStore.markHandled(context, dedupKey)
+                            if (notifyUser) {
+                                NotificationHelper.postNewFileHeadsUp(
+                                    context,
+                                    "$appName 已移至 Documents",
+                                    File(targetDir, finalName),
+                                    targetDir
+                                )
+                            }
                             handled++
                         }
                     }
@@ -290,7 +315,7 @@ object DownloadDiscoveryEngine {
                         sourcePath = entry.path,
                         fileSizeBytes = entry.size,
                         suggestedTargetDir = targetDir,
-                        matchedLabel = matchedLabel ?: "Shizuku 聊天直采",
+                        matchedLabel = matchedLabel ?: "Shizuku 微信聊天直采",
                         detectedAtText = DefaultRuleRepository.nowTimeText()
                     )
                     RuntimeStateStore.addOrUpdatePending(item)
@@ -714,42 +739,128 @@ object DownloadDiscoveryEngine {
             var fileSize = 0L
             val fromLabel: String
 
+            val extForMime = uniqueTarget.extension.lowercase(Locale.ROOT)
+            val resolvedMime = MimeTypeMap.getSingleton().getMimeTypeFromExtension(extForMime)
+                ?: "application/octet-stream"
+
+            fun writeStreamToTargetOrMediaStore(input: java.io.InputStream): Pair<Long, String?> {
+                // 优先直接以主 App 进程写入 /storage/emulated/0/Documents/...，确保归属权与文件管理器完全兼容
+                val directBytes = runCatching {
+                    targetDir.mkdirs()
+                    var total = 0L
+                    FileOutputStream(uniqueTarget).use { out ->
+                        val buf = ByteArray(65536)
+                        while (true) {
+                            val r = input.read(buf)
+                            if (r <= 0) break
+                            out.write(buf, 0, r)
+                            total += r
+                        }
+                        out.fd.sync()
+                    }
+                    total
+                }.getOrNull()
+                if (directBytes != null && directBytes > 0L && uniqueTarget.exists()) {
+                    return directBytes to uniqueTarget.absolutePath
+                }
+
+                // 若个别机型直接写文件受限，回退 Android 原生 MediaStore.Files 写入 Documents 目录，保证文件管理器秒见
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    val extRoot = Environment.getExternalStorageDirectory().absolutePath.trimEnd('/')
+                    val relDir = cleanDir
+                        .removePrefix(extRoot)
+                        .trim('/')
+                        .ifBlank { Environment.DIRECTORY_DOCUMENTS }
+                    val values = ContentValues().apply {
+                        put(MediaStore.MediaColumns.DISPLAY_NAME, uniqueTarget.name)
+                        put(MediaStore.MediaColumns.MIME_TYPE, resolvedMime)
+                        put(MediaStore.MediaColumns.RELATIVE_PATH, "$relDir/")
+                    }
+                    val uri = context.contentResolver.insert(MediaStore.Files.getContentUri("external"), values)
+                    if (uri != null) {
+                        var total = 0L
+                        context.contentResolver.openOutputStream(uri)?.use { out ->
+                            val buf = ByteArray(65536)
+                            while (true) {
+                                val r = input.read(buf)
+                                if (r <= 0) break
+                                out.write(buf, 0, r)
+                                total += r
+                            }
+                            out.flush()
+                        }
+                        if (total > 0L) {
+                            return total to "$extRoot/$relDir/${uniqueTarget.name}"
+                        }
+                    }
+                }
+                return 0L to null
+            }
+
+            var finalSavedPath = uniqueTarget.absolutePath
+
             if (!sourcePath.isNullOrBlank()) {
                 val src = File(sourcePath)
                 if (src.exists() && src.isFile && src.canRead()) {
                     fileSize = src.length()
                     fromLabel = src.absolutePath
-                    src.copyTo(uniqueTarget, overwrite = allowOverwrite)
+                    val (written, savedPath) = src.inputStream().use { input ->
+                        writeStreamToTargetOrMediaStore(input)
+                    }
+                    if (written <= 0L || savedPath == null) return false
+                    fileSize = written
+                    finalSavedPath = savedPath
                     if (!copyOnly) src.delete()
                     RuntimeStateStore.removePendingByPath(sourcePath)
                 } else if (sourcePath.contains("/Android/data/", ignoreCase = true) && ShizukuPrivateDirBridge.isReady()) {
                     fromLabel = sourcePath
-                    val transferred = ShizukuPrivateDirBridge.transferFile(
-                        sourcePath = sourcePath,
-                        targetPath = uniqueTarget.absolutePath,
-                        copyOnly = copyOnly
-                    )
-                    if (!transferred || !uniqueTarget.exists()) return false
-                    fileSize = uniqueTarget.length()
-                    RuntimeStateStore.removePendingByPath(sourcePath)
+                    // 首选：通过 Shizuku ParcelFileDescriptor 由主 App 进程直接写入 Documents（避免 UID 2000 写盘导致文件管理器不可见）
+                    val pfd = ShizukuPrivateDirBridge.openReadFd(sourcePath)
+                    if (pfd != null) {
+                        val expectedSize = runCatching { pfd.statSize }.getOrDefault(-1L)
+                        val (written, savedPath) = ParcelFileDescriptor.AutoCloseInputStream(pfd).use { input ->
+                            writeStreamToTargetOrMediaStore(input)
+                        }
+                        if (written <= 0L || savedPath == null) return false
+                        if (expectedSize > 0L && written != expectedSize) return false
+                        fileSize = written
+                        finalSavedPath = savedPath
+                        if (!copyOnly) {
+                            ShizukuPrivateDirBridge.deleteFile(sourcePath)
+                        }
+                        RuntimeStateStore.removePendingByPath(sourcePath)
+                    } else {
+                        // 兜底回退：若 FD 不可用，使用远程 transferFile
+                        val transferred = ShizukuPrivateDirBridge.transferFile(
+                            sourcePath = sourcePath,
+                            targetPath = uniqueTarget.absolutePath,
+                            copyOnly = copyOnly
+                        )
+                        if (!transferred || !uniqueTarget.exists()) return false
+                        fileSize = uniqueTarget.length()
+                        finalSavedPath = uniqueTarget.absolutePath
+                        RuntimeStateStore.removePendingByPath(sourcePath)
+                    }
                 } else {
                     return false
                 }
             } else if (sharedUri != null) {
                 fromLabel = sharedUri.toString()
-                context.contentResolver.openInputStream(sharedUri)?.use { input ->
-                    uniqueTarget.outputStream().use { output -> input.copyTo(output) }
+                val (written, savedPath) = context.contentResolver.openInputStream(sharedUri)?.use { input ->
+                    writeStreamToTargetOrMediaStore(input)
                 } ?: return false
-                fileSize = uniqueTarget.length()
+                if (written <= 0L || savedPath == null) return false
+                fileSize = written
+                finalSavedPath = savedPath
             } else {
                 return false
             }
 
-            // Android 17 MediaStore 索引即时刷新
+            // Android 11–17 携带真实 MIME 类型即时刷新 MediaStore，确保手机文件管理器「Documents / 文档」立即可见
             MediaScannerConnection.scanFile(
                 context.applicationContext,
-                arrayOf(uniqueTarget.absolutePath),
-                null,
+                arrayOf(finalSavedPath),
+                arrayOf(resolvedMime),
                 null
             )
 
@@ -758,9 +869,9 @@ object DownloadDiscoveryEngine {
                 TransferHistoryItem(
                     id = "hist_${System.currentTimeMillis()}",
                     appName = appName,
-                    fileName = uniqueTarget.name,
+                    fileName = File(finalSavedPath).name,
                     fromPath = fromLabel,
-                    toPath = uniqueTarget.absolutePath,
+                    toPath = finalSavedPath,
                     fileSizeBytes = fileSize,
                     copyOnly = copyOnly || sharedUri != null,
                     restored = false,
@@ -769,7 +880,7 @@ object DownloadDiscoveryEngine {
                     status = "completed"
                 )
             )
-            RuntimeStateStore.appendLog("${if (copyOnly) "复制" else "移动"}成功：${uniqueTarget.name} -> $cleanDir")
+            RuntimeStateStore.appendLog("${if (copyOnly) "复制" else "移动"}成功：${File(finalSavedPath).name} -> $cleanDir")
             NotificationHelper.vibrateOnArchiveSuccess(context.applicationContext)
             true
         }.onFailure { err ->

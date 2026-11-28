@@ -374,7 +374,7 @@ object DefaultRuleRepository {
             }
         }
 
-        val fallback = rule?.defaultTargetDir ?: "/storage/emulated/0/Documents/已归位文件/"
+        val fallback = rule?.defaultTargetDir ?: "/storage/emulated/0/Documents/"
         return ensureTrailingSlash(fallback) to null
     }
 

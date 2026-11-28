@@ -38,6 +38,7 @@ object RuntimeStateStore {
     private const val KEY_QUICK_SILENT_SHARE = "quick_silent_share_archive"
     private const val KEY_SAF_TREE_URIS = "saf_tree_uris"
     private const val KEY_SHIZUKU_ENABLED = "shizuku_enabled"
+    private const val KEY_SHIZUKU_AUTO_MOVE_DOCS = "shizuku_auto_move_docs"
 
     private val mainHandler = Handler(Looper.getMainLooper())
 
@@ -74,6 +75,7 @@ object RuntimeStateStore {
     var ignoredUpdateTag by mutableStateOf("")
     var quickSilentShareArchive by mutableStateOf(false)
     var shizukuEnabled by mutableStateOf(true)
+    var shizukuAutoMoveToDocuments by mutableStateOf(true)
 
     private val handledKeys = linkedSetOf<String>()
 
@@ -97,6 +99,7 @@ object RuntimeStateStore {
         ignoredUpdateTag = prefs.getString(KEY_IGNORED_UPDATE_TAG, "") ?: ""
         quickSilentShareArchive = prefs.getBoolean(KEY_QUICK_SILENT_SHARE, false)
         shizukuEnabled = prefs.getBoolean(KEY_SHIZUKU_ENABLED, true)
+        shizukuAutoMoveToDocuments = prefs.getBoolean(KEY_SHIZUKU_AUTO_MOVE_DOCS, true)
 
         safTreeUris.clear()
         prefs.getStringSet(KEY_SAF_TREE_URIS, emptySet())?.let { safTreeUris.addAll(it) }
@@ -497,7 +500,8 @@ object RuntimeStateStore {
         autoCheckUpdate: Boolean = autoCheckUpdateEnabled,
         updateRepo: String = githubUpdateRepo,
         quickSilentShare: Boolean = quickSilentShareArchive,
-        shizuku: Boolean = shizukuEnabled
+        shizuku: Boolean = shizukuEnabled,
+        shizukuAutoMoveDocs: Boolean = shizukuAutoMoveToDocuments
     ) {
         ensureInit(context)
         universalScanEnabled = universal
@@ -514,6 +518,7 @@ object RuntimeStateStore {
         githubUpdateRepo = updateRepo.trim().ifBlank { "legeng49/FileRoute-Android-NoRoot" }
         quickSilentShareArchive = quickSilentShare
         shizukuEnabled = shizuku
+        shizukuAutoMoveToDocuments = shizukuAutoMoveDocs
         context.applicationContext.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
             .edit()
             .putBoolean(KEY_UNIVERSAL_SCAN, universal)
@@ -530,6 +535,7 @@ object RuntimeStateStore {
             .putString(KEY_GITHUB_UPDATE_REPO, githubUpdateRepo)
             .putBoolean(KEY_QUICK_SILENT_SHARE, quickSilentShare)
             .putBoolean(KEY_SHIZUKU_ENABLED, shizuku)
+            .putBoolean(KEY_SHIZUKU_AUTO_MOVE_DOCS, shizukuAutoMoveDocs)
             .apply()
     }
 

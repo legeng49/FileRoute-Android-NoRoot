@@ -4,18 +4,24 @@ import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
+import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
 import android.net.Uri
+import android.os.Build
 import android.os.Environment
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.os.ParcelFileDescriptor
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import app.fileroute.data.RuntimeStateStore
+import app.fileroute.service.DownloadMonitorService
+import app.fileroute.util.DownloadDiscoveryEngine
 import org.json.JSONArray
 import rikka.shizuku.Shizuku
+import java.util.concurrent.Executors
 
 data class ShizukuFileEntry(
     val path: String,
@@ -24,12 +30,20 @@ data class ShizukuFileEntry(
     val lastModified: Long
 )
 
+data class ShizukuDirDiag(
+    val dirPath: String,
+    val fileCount: Int,
+    val latestFileName: String,
+    val latestModified: Long
+)
+
 object ShizukuPrivateDirBridge {
 
     private const val SHIZUKU_PKG = "moe.shizuku.privileged.api"
     private const val REQ_CODE_SHIZUKU = 41007
 
     private val mainHandler = Handler(Looper.getMainLooper())
+    private val bgExecutor = Executors.newSingleThreadExecutor()
     private var appContext: Context? = null
     private var listenersRegistered = false
 
@@ -53,6 +67,7 @@ object ShizukuPrivateDirBridge {
     fun defaultPrivateChatDirs(): List<String> {
         val extRoot = Environment.getExternalStorageDirectory().absolutePath
         return listOf(
+            "$extRoot/Android/data/com.tencent.mm/MicroMsg",
             "$extRoot/Android/data/com.tencent.mm/MicroMsg/Download",
             "$extRoot/Android/data/com.tencent.mobileqq/Tencent/QQfile_recv",
             "$extRoot/Android/data/com.tencent.tim/Tencent/TIMfile_recv",
@@ -84,13 +99,13 @@ object ShizukuPrivateDirBridge {
             val granted = grantResult == PackageManager.PERMISSION_GRANTED
             mainHandler.post {
                 permissionGranted = granted
-                statusText = if (granted) "Shizuku 已授权，正在绑定私有目录服务..." else "您拒绝了 Shizuku 授权"
+                statusText = if (granted) "Shizuku 已授权，正在连接微信私有目录服务..." else "您拒绝了 Shizuku 授权"
             }
             if (granted) {
                 appContext?.let { ctx ->
                     RuntimeStateStore.updateSettings(ctx, shizuku = true)
                     bindService(ctx)
-                    RuntimeStateStore.appendLog("Shizuku 授权成功，已启用微信/QQ 聊天私有目录直采通道")
+                    RuntimeStateStore.appendLog("Shizuku 授权成功，正在绑定微信 MicroMsg/attachment 私有目录直采通道")
                 }
             }
         }
@@ -102,9 +117,32 @@ object ShizukuPrivateDirBridge {
                 remoteService = IPrivateDirService.Stub.asInterface(service)
                 mainHandler.post {
                     serviceBound = true
-                    statusText = "Shizuku 已就绪 · 微信/QQ 聊天私有目录实时监听可用"
+                    statusText = "Shizuku 已就绪 · 微信 MicroMsg/attachment 实时监听可用"
                 }
-                RuntimeStateStore.appendLog("Shizuku UserService 绑定成功（可实时读取 /Android/data/ 聊天文件）")
+                RuntimeStateStore.appendLog("Shizuku UserService 绑定成功，已覆盖微信 MicroMsg/<账号>/attachment 与 Download 目录")
+                appContext?.let { ctx ->
+                    // 若已开启守护，立即拉起前台守护以启动 2.5 秒微信私有目录实时巡检
+                    if (RuntimeStateStore.guardArmed) {
+                        runCatching {
+                            val svcIntent = Intent(ctx, DownloadMonitorService::class.java)
+                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                                ctx.startForegroundService(svcIntent)
+                            } else {
+                                ctx.startService(svcIntent)
+                            }
+                        }
+                    }
+                    // 绑定成功后立刻后台扫描近 7 天微信聊天文件，方便用户第一时间在待归位队列中看到
+                    bgExecutor.execute {
+                        DownloadDiscoveryEngine.scanShizukuPrivateDirs(
+                            context = ctx,
+                            cutoffMillis = System.currentTimeMillis() - 7L * 24 * 60 * 60_000L,
+                            notifyUser = false,
+                            includeAlreadyHandledInPending = true,
+                            skipStabilityDebounce = true
+                        )
+                    }
+                }
             }
         }
 
@@ -153,7 +191,7 @@ object ShizukuPrivateDirBridge {
             !installed -> "未安装 Shizuku（当前自动运行零 Shizuku 公共目录模式）"
             !alive -> "已安装 Shizuku，但服务未启动（请先在 Shizuku 中开启无线调试）"
             !granted -> "Shizuku 运行中 · 点击「授权 Shizuku」即可开启微信聊天直采"
-            bound -> "Shizuku 已就绪 · 微信/QQ 聊天私有目录实时监听可用"
+            bound -> "Shizuku 已就绪 · 微信 MicroMsg/attachment 实时监听可用"
             else -> "Shizuku 已授权 · 正在连接私有目录通道"
         }
         mainHandler.post {
@@ -188,13 +226,18 @@ object ShizukuPrivateDirBridge {
         if (!binderAlive || !permissionGranted) return
         if (remoteService != null) return
         runCatching {
+            val isDebuggable = (app.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE) != 0
+            val verCode = runCatching {
+                val pi = app.packageManager.getPackageInfo(app.packageName, 0)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) pi.longVersionCode.toInt() else @Suppress("DEPRECATION") pi.versionCode
+            }.getOrDefault(8)
             val args = userServiceArgs ?: Shizuku.UserServiceArgs(
                 ComponentName(app.packageName, PrivateDirUserService::class.java.name)
             )
                 .daemon(false)
                 .processNameSuffix("shizuku_fs")
-                .debuggable(false)
-                .version(7)
+                .debuggable(isDebuggable)
+                .version(verCode)
                 .also { userServiceArgs = it }
             Shizuku.bindUserService(args, serviceConnection)
         }.onFailure { err ->
@@ -238,7 +281,7 @@ object ShizukuPrivateDirBridge {
             .filter { it.enabled }
             .forEach { rule ->
                 rule.sourcePaths
-                    .filter { it.contains("/Android/data/", ignoreCase = true) }
+                    .filter { it.contains("/Android/data/", ignoreCase = true) || it.contains("MicroMsg", ignoreCase = true) }
                     .forEach { targetDirs.add(it.trimEnd('/')) }
             }
 
@@ -258,9 +301,42 @@ object ShizukuPrivateDirBridge {
                 )
             }
             list
+        }.onFailure { err ->
+            RuntimeStateStore.appendLog("Shizuku 扫描异常：${err.message ?: "服务连接中断"}")
         }.getOrElse {
             emptyList()
         }
+    }
+
+    fun diagnoseWeChatDirs(): List<ShizukuDirDiag> {
+        val svc = remoteService ?: return emptyList()
+        return runCatching {
+            val jsonStr = svc.diagnoseWeChatDirsJson(defaultPrivateChatDirs().toTypedArray())
+            val arr = JSONArray(jsonStr)
+            val list = ArrayList<ShizukuDirDiag>(arr.length())
+            for (i in 0 until arr.length()) {
+                val obj = arr.getJSONObject(i)
+                list.add(
+                    ShizukuDirDiag(
+                        dirPath = obj.optString("dirPath"),
+                        fileCount = obj.optInt("fileCount", 0),
+                        latestFileName = obj.optString("latestFileName", ""),
+                        latestModified = obj.optLong("latestModified", 0L)
+                    )
+                )
+            }
+            list.sortedByDescending { it.latestModified }
+        }.getOrElse { emptyList() }
+    }
+
+    fun openReadFd(sourcePath: String): ParcelFileDescriptor? {
+        val svc = remoteService ?: return null
+        return runCatching { svc.openReadFd(sourcePath) }.getOrNull()
+    }
+
+    fun deleteFile(filePath: String): Boolean {
+        val svc = remoteService ?: return false
+        return runCatching { svc.deleteFile(filePath) }.getOrDefault(false)
     }
 
     fun transferFile(sourcePath: String, targetPath: String, copyOnly: Boolean): Boolean {

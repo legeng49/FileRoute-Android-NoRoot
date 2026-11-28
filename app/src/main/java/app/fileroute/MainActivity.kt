@@ -6,6 +6,7 @@ import android.content.Intent
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.Environment
 import android.os.PowerManager
 import android.provider.Settings
 import android.widget.Toast
@@ -27,6 +28,7 @@ import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
@@ -53,6 +55,7 @@ import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -960,17 +963,24 @@ private fun MonitorHomeTab(
                                     Toast.makeText(context, "请先授予「所有文件访问权限」", Toast.LENGTH_SHORT).show()
                                     return@OutlinedButton
                                 }
-                                val count = DownloadDiscoveryEngine.scanAndProcessRecent(
-                                    context = context,
-                                    lookbackMinutes = 180,
-                                    notifyUser = false,
-                                    includeAlreadyHandledInPending = true
-                                )
-                                Toast.makeText(
-                                    context,
-                                    "扫描完成：待归位队列现有 ${RuntimeStateStore.pendingItems.size} 个文件（新增 $count）",
-                                    Toast.LENGTH_SHORT
-                                ).show()
+                                val executor = Executors.newSingleThreadExecutor()
+                                val mainHandler = Handler(Looper.getMainLooper())
+                                executor.execute {
+                                    val count = DownloadDiscoveryEngine.scanAndProcessRecent(
+                                        context = context,
+                                        lookbackMinutes = 7 * 24 * 60,
+                                        notifyUser = false,
+                                        includeAlreadyHandledInPending = true
+                                    )
+                                    mainHandler.post {
+                                        Toast.makeText(
+                                            context,
+                                            "扫描完成：待归位队列现有 ${RuntimeStateStore.pendingItems.size} 个文件（本次新增 $count）",
+                                            Toast.LENGTH_LONG
+                                        ).show()
+                                    }
+                                    executor.shutdown()
+                                }
                             },
                             modifier = Modifier.height(46.dp)
                         ) {
@@ -985,11 +995,51 @@ private fun MonitorHomeTab(
 
         // 5. 待归位队列
         item {
-            Text(
-                text = "待归位检测队列（${pending.size}）",
-                style = MaterialTheme.typography.titleSmall,
-                fontWeight = FontWeight.SemiBold
-            )
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = "待归位检测队列（${pending.size}）",
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.SemiBold
+                )
+                if (pending.isNotEmpty()) {
+                    TextButton(
+                        onClick = {
+                            val snapshot = pending.toList()
+                            val executor = Executors.newSingleThreadExecutor()
+                            val mainHandler = Handler(Looper.getMainLooper())
+                            executor.execute {
+                                var moved = 0
+                                snapshot.forEach { item ->
+                                    val ok = DownloadDiscoveryEngine.relocateFile(
+                                        context = context,
+                                        sourcePath = item.sourcePath,
+                                        sharedUri = null,
+                                        appName = item.appName,
+                                        fileName = item.fileName,
+                                        targetDirPath = "/storage/emulated/0/Documents/",
+                                        copyOnly = false
+                                    )
+                                    if (ok) moved++
+                                }
+                                mainHandler.post {
+                                    Toast.makeText(
+                                        context,
+                                        "已将 $moved 个文件移入 文件管理器 → Documents/",
+                                        Toast.LENGTH_LONG
+                                    ).show()
+                                }
+                                executor.shutdown()
+                            }
+                        }
+                    ) {
+                        Text("全部移至 Documents")
+                    }
+                }
+            }
         }
 
         if (pending.isEmpty()) {
@@ -1006,7 +1056,7 @@ private fun MonitorHomeTab(
                     ) {
                         Text("所有新下载文件均已归位", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Medium)
                         Text(
-                            "当微信、钉钉、飞书或浏览器写入公共目录，或在 QQ 中点击「用其他应用打开 → 归位」时，文件会自动出现在这里并弹出顶部横幅。",
+                            "微信聊天文件经 Shizuku 捕获后将直接移入 文件管理器 → Documents/；你也可以点击上方「扫描最近下载」拉取近 7 天的微信聊天文件。",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
@@ -1063,6 +1113,43 @@ private fun MonitorHomeTab(
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis
                         )
+                        Row(
+                            modifier = Modifier.fillMaxWidth().padding(top = 6.dp),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Button(
+                                onClick = {
+                                    val executor = Executors.newSingleThreadExecutor()
+                                    val mainHandler = Handler(Looper.getMainLooper())
+                                    executor.execute {
+                                        val ok = DownloadDiscoveryEngine.relocateFile(
+                                            context = context,
+                                            sourcePath = item.sourcePath,
+                                            sharedUri = null,
+                                            appName = item.appName,
+                                            fileName = item.fileName,
+                                            targetDirPath = "/storage/emulated/0/Documents/",
+                                            copyOnly = false
+                                        )
+                                        mainHandler.post {
+                                            Toast.makeText(
+                                                context,
+                                                if (ok) "已移动至 文件管理器 → Documents/${item.fileName}"
+                                                else "移动失败，请检查所有文件访问权限或 Shizuku 连接",
+                                                Toast.LENGTH_LONG
+                                            ).show()
+                                        }
+                                        executor.shutdown()
+                                    }
+                                },
+                                modifier = Modifier.weight(1f)
+                            ) {
+                                Text("直接移至 Documents")
+                            }
+                            OutlinedButton(onClick = { onOpenPicker(item) }) {
+                                Text("选其他目录")
+                            }
+                        }
                     }
                 }
             }
@@ -1623,7 +1710,10 @@ private fun RulesManageTab(
             onDismissRequest = { editingRule = null },
             title = { Text("编辑 ${target.appName} 规则") },
             text = {
-                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Column(
+                    modifier = Modifier.verticalScroll(rememberScrollState()),
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
                     OutlinedTextField(
                         value = srcText,
                         onValueChange = { srcText = it },
@@ -1635,6 +1725,11 @@ private fun RulesManageTab(
                         onValueChange = { dstText = it },
                         label = { Text("默认归位目标目录") },
                         singleLine = true
+                    )
+                    TargetMountQuickPickerSection(
+                        currentPath = dstText,
+                        sourcePaths = srcText.split(",").map { it.trim() }.filter { it.isNotEmpty() },
+                        onSelectPath = { dstText = it }
                     )
                     val liveSrcBase = DefaultRuleRepository.ensureTrailingSlash(
                         srcText.split(",").firstOrNull { it.trim().isNotEmpty() }?.trim()
@@ -1739,7 +1834,10 @@ private fun RulesManageTab(
             onDismissRequest = { showAddDialog = false },
             title = { Text("新增应用规则") },
             text = {
-                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Column(
+                    modifier = Modifier.verticalScroll(rememberScrollState()),
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
                     OutlinedTextField(
                         value = name,
                         onValueChange = { name = it },
@@ -1777,6 +1875,11 @@ private fun RulesManageTab(
                         )
                         val addDstPreview = DefaultRuleRepository.ensureTrailingSlash(
                             dstDir.trim().ifEmpty { "/storage/emulated/0/Documents/${name.trim().ifEmpty { "自定义应用" }}归档/" }
+                        )
+                        TargetMountQuickPickerSection(
+                            currentPath = dstDir.ifBlank { addDstPreview },
+                            sourcePaths = listOf(addSrcPreview),
+                            onSelectPath = { dstDir = it }
                         )
                         Text(
                             "假设有新文件：${addSrcPreview}2026项目方案.pdf -> ${addDstPreview}2026项目方案.pdf",
@@ -1900,6 +2003,151 @@ private fun RulesManageTab(
                 ) { Text("关闭") }
             }
         )
+    }
+}
+
+@Composable
+private fun TargetMountQuickPickerSection(
+    currentPath: String,
+    sourcePaths: List<String>,
+    onSelectPath: (String) -> Unit
+) {
+    val extRoot = remember {
+        runCatching { Environment.getExternalStorageDirectory().absolutePath.trimEnd('/') }
+            .getOrDefault("/storage/emulated/0")
+    }
+    val presets = remember(extRoot) {
+        listOf(
+            "Documents 文档" to "$extRoot/Documents/",
+            "Download 下载" to "$extRoot/Download/",
+            "Pictures 图片" to "$extRoot/Pictures/",
+            "Movies 视频" to "$extRoot/Movies/",
+            "Music 音频" to "$extRoot/Music/",
+            "DCIM 相册" to "$extRoot/DCIM/"
+        )
+    }
+
+    fun normalizeToCanonical(raw: String): String {
+        val cleaned = raw.trim().replace("\\", "/").replace(Regex("/+"), "/")
+        if (cleaned.isEmpty()) return ""
+        val lower = cleaned.lowercase()
+        val mapped = when {
+            lower == "/sdcard" || lower.startsWith("/sdcard/") ->
+                extRoot + cleaned.substring("/sdcard".length).ifEmpty { "/" }
+            lower == "/storage/self/primary" || lower.startsWith("/storage/self/primary/") ->
+                extRoot + cleaned.substring("/storage/self/primary".length).ifEmpty { "/" }
+            else -> cleaned
+        }
+        return DefaultRuleRepository.ensureTrailingSlash(mapped)
+    }
+
+    val canonical = normalizeToCanonical(currentPath)
+    val rootPrefix = "$extRoot/"
+    val isUnderExternal = canonical.lowercase().startsWith(rootPrefix.lowercase()) &&
+        !canonical.contains("/../") && !canonical.endsWith("/..")
+    val relativePart = if (isUnderExternal) canonical.substring(rootPrefix.length) else ""
+    val sdcardMount = if (isUnderExternal) {
+        DefaultRuleRepository.ensureTrailingSlash("/sdcard/$relativePart")
+    } else {
+        canonical.ifEmpty { "/sdcard/Documents/" }
+    }
+    val lowerCanonical = canonical.lowercase()
+    val isRestricted = isUnderExternal && (
+        lowerCanonical.startsWith("${rootPrefix.lowercase()}android/data/") ||
+            lowerCanonical.startsWith("${rootPrefix.lowercase()}android/obb/")
+        )
+    val hasLoopRisk = isUnderExternal && sourcePaths.any { src ->
+        val normSrc = normalizeToCanonical(src).lowercase()
+        normSrc.isNotEmpty() && (lowerCanonical == normSrc || lowerCanonical.startsWith(normSrc))
+    }
+
+    val mountStatus = remember(canonical, isUnderExternal, isRestricted, hasLoopRisk) {
+        when {
+            canonical.isEmpty() || !isUnderExternal -> Triple(
+                "路径格式无效 · 请选上方常用路径",
+                Color(0xFFBE123C),
+                Color(0xFFFFF1F2)
+            )
+            isRestricted -> Triple(
+                "私有隔离目录 · 常规文件管理器不可见",
+                Color(0xFFB45309),
+                Color(0xFFFFFBEB)
+            )
+            hasLoopRisk -> Triple(
+                "风险提示 · 与来源目录重叠易循环触发",
+                Color(0xFFBE123C),
+                Color(0xFFFFF1F2)
+            )
+            else -> {
+                val targetDir = File(canonical.trimEnd('/'))
+                if (targetDir.exists() && targetDir.isDirectory) {
+                    if (targetDir.canWrite()) {
+                        Triple("路径有效 · 实机目录已存在且可写入", Color(0xFF0F766E), Color(0xFFF0FDFA))
+                    } else {
+                        Triple("目录已存在 · 请确认已授予所有文件访问权限", Color(0xFFB45309), Color(0xFFFFFBEB))
+                    }
+                } else {
+                    var ancestor = targetDir.parentFile
+                    while (ancestor != null && !ancestor.exists()) {
+                        ancestor = ancestor.parentFile
+                    }
+                    if (ancestor != null && ancestor.canWrite()) {
+                        Triple("路径有效 · 首次归位时自动创建子目录", Color(0xFF1D4ED8), Color(0xFFEFF6FF))
+                    } else {
+                        Triple("待授权写入 · 请先授予所有文件访问权限", Color(0xFFB45309), Color(0xFFFFFBEB))
+                    }
+                }
+            }
+        }
+    }
+
+    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        Text(
+            "常用导出路径快速选择器",
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        Row(
+            modifier = Modifier.horizontalScroll(rememberScrollState()),
+            horizontalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            presets.forEach { (label, path) ->
+                FilterChip(
+                    selected = canonical.equals(path, ignoreCase = true),
+                    onClick = { onSelectPath(path) },
+                    label = { Text(label, style = MaterialTheme.typography.labelSmall) }
+                )
+            }
+        }
+        Surface(
+            color = mountStatus.third,
+            shape = RoundedCornerShape(10.dp),
+            border = BorderStroke(1.dp, mountStatus.second.copy(alpha = 0.25f))
+        ) {
+            Column(
+                modifier = Modifier.fillMaxWidth().padding(10.dp),
+                verticalArrangement = Arrangement.spacedBy(3.dp)
+            ) {
+                Text(
+                    "当前设备真实挂载点 · ${mountStatus.first}",
+                    style = MaterialTheme.typography.labelSmall,
+                    fontWeight = FontWeight.SemiBold,
+                    color = mountStatus.second
+                )
+                Text(
+                    "挂载点：$sdcardMount",
+                    style = MaterialTheme.typography.labelSmall,
+                    fontFamily = FontFamily.Monospace,
+                    color = MaterialTheme.colorScheme.onSurface
+                )
+                Text(
+                    "物理路径：${canonical.ifEmpty { "$extRoot/Documents/" }}",
+                    style = MaterialTheme.typography.labelSmall,
+                    fontFamily = FontFamily.Monospace,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+        }
     }
 }
 
@@ -2088,6 +2336,20 @@ private fun HistoryLedgerTab() {
                             horizontalArrangement = Arrangement.End
                         ) {
                             if (effectiveStatus == "completed") {
+                                TextButton(onClick = {
+                                    val openIntent = Intent(
+                                        context,
+                                        app.fileroute.ui.OpenSourceFolderActivity::class.java
+                                    ).apply {
+                                        putExtra(DownloadMonitorService.EXTRA_SOURCE_PATH, rec.toPath)
+                                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                    }
+                                    runCatching { context.startActivity(openIntent) }.onFailure {
+                                        Toast.makeText(context, "文件位置：${rec.toPath}", Toast.LENGTH_LONG).show()
+                                    }
+                                }) {
+                                    Text("在文件管理器查看")
+                                }
                                 TextButton(onClick = {
                                     val ok = DownloadDiscoveryEngine.undoTransfer(context, rec)
                                     Toast.makeText(
@@ -3158,8 +3420,11 @@ private fun SettingsManageTab(
             }
         }
 
-        // 可选 Shizuku 增强通道设置卡片（微信/QQ 聊天私有目录直采）
+        // 可选 Shizuku 增强通道设置卡片（微信/QQ 聊天私有目录直采 + 实时目录诊断）
         item {
+            var shizukuDiags by remember { mutableStateOf<List<app.fileroute.shizuku.ShizukuDirDiag>>(emptyList()) }
+            var isScanningShizuku by remember { mutableStateOf(false) }
+
             Card(
                 modifier = Modifier.fillMaxWidth(),
                 shape = RoundedCornerShape(16.dp),
@@ -3168,12 +3433,12 @@ private fun SettingsManageTab(
             ) {
                 Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
                     Text(
-                        "微信 / QQ 聊天私有目录直采（可选 Shizuku）",
+                        "微信 / QQ 聊天私有目录直采（Shizuku）",
                         style = MaterialTheme.typography.titleSmall,
                         fontWeight = FontWeight.SemiBold
                     )
                     Text(
-                        "开启后借助 Shizuku 直接实时监听 /Android/data/com.tencent.mm/MicroMsg/Download/ 等私有目录，微信聊天点下文件即自动触发归位；未启动 Shizuku 时自动回退公共目录模式。",
+                        "自动覆盖微信 8.0+ 全部账号的 MicroMsg/<账号哈希>/attachment/ 与 MicroMsg/Download/ 目录（含双开空间），并通过 App 进程流式移入「文件管理器 → Documents/」，立即可见。",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
@@ -3202,6 +3467,26 @@ private fun SettingsManageTab(
                             }
                         )
                     }
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f).padding(end = 8.dp)) {
+                            Text("新聊天文件自动移至 Documents", style = MaterialTheme.typography.bodyMedium)
+                            Text(
+                                "开启后，在微信/QQ 聊天点下新文件时自动移动至 /storage/emulated/0/Documents/（文件管理器「文档」目录）",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                        Switch(
+                            checked = RuntimeStateStore.shizukuAutoMoveToDocuments,
+                            onCheckedChange = { autoMove ->
+                                RuntimeStateStore.updateSettings(context, shizukuAutoMoveDocs = autoMove)
+                            }
+                        )
+                    }
                     Text(
                         "当前状态：${ShizukuPrivateDirBridge.statusText}",
                         style = MaterialTheme.typography.bodySmall,
@@ -3210,6 +3495,7 @@ private fun SettingsManageTab(
                     )
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         Button(
+                            enabled = !isScanningShizuku,
                             onClick = {
                                 ShizukuPrivateDirBridge.refreshState(context)
                                 when {
@@ -3221,21 +3507,28 @@ private fun SettingsManageTab(
                                     }
                                     !ShizukuPrivateDirBridge.serviceBound -> {
                                         ShizukuPrivateDirBridge.bindService(context)
+                                        Toast.makeText(context, "正在重新连接 Shizuku 文件服务，请稍候 1 秒后再点扫描", Toast.LENGTH_SHORT).show()
                                     }
                                     else -> {
+                                        isScanningShizuku = true
                                         val executor = Executors.newSingleThreadExecutor()
                                         val mainHandler = Handler(Looper.getMainLooper())
                                         executor.execute {
+                                            val diags = ShizukuPrivateDirBridge.diagnoseWeChatDirs()
                                             val count = DownloadDiscoveryEngine.scanShizukuPrivateDirs(
                                                 context = context,
-                                                cutoffMillis = System.currentTimeMillis() - 24 * 60 * 60_000L,
+                                                cutoffMillis = System.currentTimeMillis() - 7L * 24 * 60 * 60_000L,
                                                 notifyUser = false,
-                                                includeAlreadyHandledInPending = true
+                                                includeAlreadyHandledInPending = true,
+                                                skipStabilityDebounce = true
                                             )
+                                            val totalDetected = diags.sumOf { it.fileCount }
                                             mainHandler.post {
+                                                shizukuDiags = diags
+                                                isScanningShizuku = false
                                                 Toast.makeText(
                                                     context,
-                                                    "Shizuku 微信/QQ 聊天目录扫描完成：新增 $count 个待归位文件",
+                                                    "Shizuku 扫描完成：检测到 ${diags.size} 个微信/QQ 目录（共 $totalDetected 个文件），待归位队列新增 $count 项",
                                                     Toast.LENGTH_LONG
                                                 ).show()
                                             }
@@ -3247,20 +3540,52 @@ private fun SettingsManageTab(
                         ) {
                             Text(
                                 when {
+                                    isScanningShizuku -> "扫描中..."
                                     !ShizukuPrivateDirBridge.binderAlive -> "打开 Shizuku"
                                     !ShizukuPrivateDirBridge.permissionGranted -> "授权 Shizuku"
                                     !ShizukuPrivateDirBridge.serviceBound -> "连接服务"
-                                    else -> "立即扫描聊天目录"
+                                    else -> "扫描并诊断微信目录"
                                 }
                             )
                         }
                         OutlinedButton(
                             onClick = {
-                                ShizukuPrivateDirBridge.refreshState(context)
-                                Toast.makeText(context, ShizukuPrivateDirBridge.statusText, Toast.LENGTH_SHORT).show()
+                                val openDocs = Intent(
+                                    context,
+                                    app.fileroute.ui.OpenSourceFolderActivity::class.java
+                                ).apply {
+                                    putExtra(DownloadMonitorService.EXTRA_SOURCE_PATH, "/storage/emulated/0/Documents/")
+                                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                }
+                                runCatching { context.startActivity(openDocs) }.onFailure {
+                                    Toast.makeText(context, "目标路径：/storage/emulated/0/Documents/", Toast.LENGTH_LONG).show()
+                                }
                             }
                         ) {
-                            Text("刷新状态")
+                            Text("打开 Documents")
+                        }
+                    }
+
+                    if (shizukuDiags.isNotEmpty()) {
+                        Surface(color = Color(0xFFF8FAFC), shape = RoundedCornerShape(10.dp)) {
+                            Column(
+                                modifier = Modifier.fillMaxWidth().padding(10.dp),
+                                verticalArrangement = Arrangement.spacedBy(4.dp)
+                            ) {
+                                Text(
+                                    "Shizuku 实机探测到的微信/QQ 目录（${shizukuDiags.size} 个）",
+                                    style = MaterialTheme.typography.labelMedium,
+                                    fontWeight = FontWeight.SemiBold,
+                                    color = Color(0xFF0F766E)
+                                )
+                                shizukuDiags.take(6).forEach { d ->
+                                    Text(
+                                        "${d.dirPath.removePrefix("/storage/emulated/0")}（${d.fileCount} 文件${if (d.latestFileName.isNotBlank()) " · 最新：${d.latestFileName}" else ""}）",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
+                            }
                         }
                     }
                 }
