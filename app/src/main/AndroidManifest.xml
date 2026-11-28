@@ -17,6 +17,7 @@
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
     <uses-permission android:name="android.permission.VIBRATE" />
     <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
 
     <supports-screens
         android:smallScreens="true"
@@ -35,7 +36,18 @@
         android:supportsRtl="true"
         android:theme="@android:style/Theme.Material.Light.NoActionBar">
 
-        <!-- 主界面：4 标签完整功能工作台（首页守护/待归位队列、规则管理、历史撤销、路径诊断） -->
+        <!-- FileProvider：用于 GitHub Releases 自动下载 APK 后调起系统安装器 -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
+
+        <!-- 主界面：5 标签完整功能工作台（首页守护/待归位队列、规则管理、历史撤销、路径诊断、设置与自动更新） -->
         <activity
             android:name=".MainActivity"
             android:exported="true">
@@ -45,7 +57,7 @@
             </intent-filter>
         </activity>
 
-        <!-- 免 Shizuku 核心通道：接收 QQ/TIM「分享」或「用其他应用打开」，以及顶部通知点击跳转 -->
+        <!-- 免 Shizuku 核心通道：接收微信/QQ/TIM「分享」或「用其他应用打开」，以及顶部通知点击跳转 -->
         <activity
             android:name=".ui.ShareReceiverActivity"
             android:exported="true"
@@ -67,12 +79,13 @@
                 <data android:mimeType="*/*" />
             </intent-filter>
 
-            <!-- 3. 接收 QQ / 微信内「用其他应用打开」 -->
+            <!-- 3. 接收微信 / QQ 聊天内「用其他应用打开」（支持 content:// 与 file://） -->
             <intent-filter android:label="使用 归位 保存到其他目录">
                 <action android:name="android.intent.action.VIEW" />
                 <category android:name="android.intent.category.DEFAULT" />
                 <category android:name="android.intent.category.BROWSABLE" />
                 <data android:scheme="content" />
+                <data android:scheme="file" />
                 <data android:mimeType="*/*" />
             </intent-filter>
         </activity>
@@ -84,7 +97,7 @@
             android:excludeFromRecents="true"
             android:theme="@android:style/Theme.NoDisplay" />
 
-        <!-- 公共目录 + MediaStore 实时检测前台服务 -->
+        <!-- 公共目录 + MediaStore + SAF 实时检测前台服务 -->
         <service
             android:name=".service.DownloadMonitorService"
             android:exported="false"

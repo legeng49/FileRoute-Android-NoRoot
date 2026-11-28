@@ -32,6 +32,11 @@ object RuntimeStateStore {
     private const val KEY_CUSTOM_RULES_JSON = "custom_rules_json"
     private const val KEY_QUICK_FOLDERS_JSON = "quick_folders_json"
     private const val KEY_INTEGRITY_CHECK = "integrity_check_enabled"
+    private const val KEY_AUTO_CHECK_UPDATE = "auto_check_update"
+    private const val KEY_GITHUB_UPDATE_REPO = "github_update_repo"
+    private const val KEY_IGNORED_UPDATE_TAG = "ignored_update_tag"
+    private const val KEY_QUICK_SILENT_SHARE = "quick_silent_share_archive"
+    private const val KEY_SAF_TREE_URIS = "saf_tree_uris"
 
     private val mainHandler = Handler(Looper.getMainLooper())
 
@@ -51,6 +56,7 @@ object RuntimeStateStore {
     val pendingItems = mutableStateListOf<DetectedDownloadItem>()
     val historyItems = mutableStateListOf<TransferHistoryItem>()
     val runtimeLogs = mutableStateListOf<String>()
+    val safTreeUris = mutableStateListOf<String>()
 
     var universalScanEnabled by mutableStateOf(true)
     var smartClassifyEnabled by mutableStateOf(true)
@@ -62,6 +68,10 @@ object RuntimeStateStore {
     var writeVerifyDelayMs by mutableStateOf(1500L)
     var guardArmed by mutableStateOf(false)
     var integrityCheckEnabled by mutableStateOf(true)
+    var autoCheckUpdateEnabled by mutableStateOf(true)
+    var githubUpdateRepo by mutableStateOf("legeng49/FileRoute-Android-NoRoot")
+    var ignoredUpdateTag by mutableStateOf("")
+    var quickSilentShareArchive by mutableStateOf(false)
 
     private val handledKeys = linkedSetOf<String>()
 
@@ -79,6 +89,14 @@ object RuntimeStateStore {
         writeVerifyDelayMs = prefs.getLong(KEY_VERIFY_DELAY_MS, 1500L)
         guardArmed = prefs.getBoolean(KEY_GUARD_ARMED, false)
         integrityCheckEnabled = prefs.getBoolean(KEY_INTEGRITY_CHECK, true)
+        autoCheckUpdateEnabled = prefs.getBoolean(KEY_AUTO_CHECK_UPDATE, true)
+        githubUpdateRepo = prefs.getString(KEY_GITHUB_UPDATE_REPO, "legeng49/FileRoute-Android-NoRoot")
+            ?.takeIf { it.isNotBlank() } ?: "legeng49/FileRoute-Android-NoRoot"
+        ignoredUpdateTag = prefs.getString(KEY_IGNORED_UPDATE_TAG, "") ?: ""
+        quickSilentShareArchive = prefs.getBoolean(KEY_QUICK_SILENT_SHARE, false)
+
+        safTreeUris.clear()
+        prefs.getStringSet(KEY_SAF_TREE_URIS, emptySet())?.let { safTreeUris.addAll(it) }
 
         rules.clear()
         rules.addAll(DefaultRuleRepository.initialRules)
@@ -472,7 +490,10 @@ object RuntimeStateStore {
         coalesceBatch: Boolean = coalesceBatchDownloads,
         verifyDelayMs: Long = writeVerifyDelayMs,
         armed: Boolean = guardArmed,
-        integrityCheck: Boolean = integrityCheckEnabled
+        integrityCheck: Boolean = integrityCheckEnabled,
+        autoCheckUpdate: Boolean = autoCheckUpdateEnabled,
+        updateRepo: String = githubUpdateRepo,
+        quickSilentShare: Boolean = quickSilentShareArchive
     ) {
         ensureInit(context)
         universalScanEnabled = universal
@@ -485,6 +506,9 @@ object RuntimeStateStore {
         writeVerifyDelayMs = verifyDelayMs
         guardArmed = armed
         integrityCheckEnabled = integrityCheck
+        autoCheckUpdateEnabled = autoCheckUpdate
+        githubUpdateRepo = updateRepo.trim().ifBlank { "legeng49/FileRoute-Android-NoRoot" }
+        quickSilentShareArchive = quickSilentShare
         context.applicationContext.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
             .edit()
             .putBoolean(KEY_UNIVERSAL_SCAN, universal)
@@ -497,6 +521,41 @@ object RuntimeStateStore {
             .putLong(KEY_VERIFY_DELAY_MS, verifyDelayMs)
             .putBoolean(KEY_GUARD_ARMED, armed)
             .putBoolean(KEY_INTEGRITY_CHECK, integrityCheck)
+            .putBoolean(KEY_AUTO_CHECK_UPDATE, autoCheckUpdate)
+            .putString(KEY_GITHUB_UPDATE_REPO, githubUpdateRepo)
+            .putBoolean(KEY_QUICK_SILENT_SHARE, quickSilentShare)
+            .apply()
+    }
+
+    fun ignoreUpdateTag(context: Context, tag: String) {
+        ensureInit(context)
+        ignoredUpdateTag = tag
+        context.applicationContext.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putString(KEY_IGNORED_UPDATE_TAG, tag)
+            .apply()
+    }
+
+    fun addSafTreeUri(context: Context, uriString: String) {
+        ensureInit(context)
+        if (!safTreeUris.contains(uriString)) {
+            runOnMain { safTreeUris.add(uriString) }
+            val nextSet = safTreeUris.toMutableSet().apply { add(uriString) }
+            context.applicationContext.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
+                .edit()
+                .putStringSet(KEY_SAF_TREE_URIS, nextSet)
+                .apply()
+            appendLog("已添加 SAF 聊天目录深度监控授权：$uriString")
+        }
+    }
+
+    fun removeSafTreeUri(context: Context, uriString: String) {
+        ensureInit(context)
+        runOnMain { safTreeUris.remove(uriString) }
+        val nextSet = safTreeUris.toMutableSet().apply { remove(uriString) }
+        context.applicationContext.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putStringSet(KEY_SAF_TREE_URIS, nextSet)
             .apply()
     }
 

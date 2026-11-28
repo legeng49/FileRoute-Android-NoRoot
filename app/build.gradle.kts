@@ -14,8 +14,8 @@ android {
         applicationId = "app.fileroute"
         minSdk = 26
         targetSdk = 37
-        versionCode = 5
-        versionName = "3.0.0-android17"
+        versionCode = 6
+        versionName = "3.1.0-android17"
     }
 
     buildTypes {

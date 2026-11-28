@@ -5,6 +5,7 @@ import android.media.MediaScannerConnection
 import android.net.Uri
 import android.os.Build
 import android.os.Environment
+import android.provider.DocumentsContract
 import android.provider.MediaStore
 import app.fileroute.data.ChannelMode
 import app.fileroute.data.DefaultRuleRepository
@@ -23,6 +24,12 @@ object DownloadDiscoveryEngine {
 
     private val IGNORED_EXTENSIONS = setOf("tmp", "crdownload", "part", "download", "pending", "bak")
 
+    fun buildWeChatChatSafInitialUri(): Uri {
+        return Uri.parse(
+            "content://com.android.externalstorage.documents/document/primary%3AAndroid%2Fdata%2Fcom.tencent.mm%2FMicroMsg%2FDownload"
+        )
+    }
+
     fun hasAllFilesAccess(): Boolean {
         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             Environment.isExternalStorageManager()
@@ -32,7 +39,7 @@ object DownloadDiscoveryEngine {
     }
 
     /**
-     * 核心发现入口：同时扫描 MediaStore.Downloads / MediaStore.Files 与所有常见/自定义下载目录，
+     * 核心发现入口：同时扫描 MediaStore.Downloads / MediaStore.Files、物理下载目录以及 SAF 授权聊天目录，
      * 即使不同手机 ROM 的微信/QQ下载路径不同也能自动捕获！
      */
     fun scanAndProcessRecent(
@@ -48,7 +55,7 @@ object DownloadDiscoveryEngine {
         // 1. Layer A: 系统 MediaStore 查询（完全不受厂商目录差异影响，还能拿到来源包名）
         queryMediaStoreRecent(context, cutoffMillis, foundMap)
 
-        // 2. Layer B: 物理目录递归扫描（补齐 MediaStore 尚未索引的新写入文件）
+        // 2. Layer B: 物理目录递归扫描（补齐 MediaStore 尚未索引的新写入文件，安全探测微信/QQ私有目录）
         val rootsToScan = linkedSetOf<String>()
         RuntimeStateStore.rules
             .filter { it.enabled && it.channel == ChannelMode.PUBLIC_OBSERVER && it.action != RouteAction.IGNORE }
@@ -64,6 +71,9 @@ object DownloadDiscoveryEngine {
             rootsToScan.add("$extRoot/Documents/QQ")
             rootsToScan.add("$extRoot/Tencent/MicroMsg/Download")
             rootsToScan.add("$extRoot/Tencent/QQfile_recv")
+            // 部分平板 / ROM 允许直接读取的聊天目录（如被系统隔离则自动跳过，不会报错）
+            rootsToScan.add("$extRoot/Android/data/com.tencent.mm/MicroMsg/Download")
+            rootsToScan.add("$extRoot/Android/data/com.tencent.mobileqq/Tencent/QQfile_recv")
         }
 
         rootsToScan.forEach { path ->
@@ -73,7 +83,12 @@ object DownloadDiscoveryEngine {
             }
         }
 
-        var newlyHandledCount = 0
+        var newlyHandledCount = scanSafAuthorizedTrees(
+            context = context,
+            cutoffMillis = cutoffMillis,
+            notifyUser = notifyUser,
+            includeAlreadyHandledInPending = includeAlreadyHandledInPending
+        )
         for ((absPath, pair) in foundMap) {
             val (file, ownerPkg) = pair
             if (!isEligibleFile(file)) continue
@@ -160,6 +175,129 @@ object DownloadDiscoveryEngine {
             RuntimeStateStore.appendLog("本次扫描发现 $newlyHandledCount 个新下载文件")
         }
         return newlyHandledCount
+    }
+
+    /**
+     * Layer C: 扫描已通过系统 SAF (ACTION_OPEN_DOCUMENT_TREE) 持久化授权的聊天目录（如微信 MicroMsg/Download）
+     */
+    private fun scanSafAuthorizedTrees(
+        context: Context,
+        cutoffMillis: Long,
+        notifyUser: Boolean,
+        includeAlreadyHandledInPending: Boolean
+    ): Int {
+        val uris = RuntimeStateStore.safTreeUris.toList()
+        if (uris.isEmpty()) return 0
+        var handled = 0
+        val projection = arrayOf(
+            DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+            DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+            DocumentsContract.Document.COLUMN_MIME_TYPE,
+            DocumentsContract.Document.COLUMN_LAST_MODIFIED,
+            DocumentsContract.Document.COLUMN_SIZE
+        )
+        for (treeUriStr in uris) {
+            runCatching {
+                val treeUri = Uri.parse(treeUriStr)
+                val docId = DocumentsContract.getTreeDocumentId(treeUri)
+                val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, docId)
+                val lowerTree = treeUriStr.lowercase(Locale.ROOT)
+                val inferredApp = when {
+                    lowerTree.contains("tencent.mm") || lowerTree.contains("micromsg") || lowerTree.contains("weixin") -> "微信（聊天目录）"
+                    lowerTree.contains("mobileqq") || lowerTree.contains("qqfile") -> "QQ（聊天目录）"
+                    else -> "SAF 授权目录"
+                }
+                val matchedRule = RuntimeStateStore.rules.firstOrNull { r ->
+                    r.enabled && when {
+                        inferredApp.startsWith("微信") -> r.packageName == "com.tencent.mm"
+                        inferredApp.startsWith("QQ") -> r.packageName == "com.tencent.mobileqq"
+                        else -> false
+                    }
+                }
+                context.contentResolver.query(childrenUri, projection, null, null, null)?.use { cursor ->
+                    val idIdx = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_DOCUMENT_ID)
+                    val nameIdx = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
+                    val mimeIdx = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_MIME_TYPE)
+                    val modIdx = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_LAST_MODIFIED)
+                    val sizeIdx = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_SIZE)
+                    while (cursor.moveToNext()) {
+                        val childId = if (idIdx >= 0) cursor.getString(idIdx) else continue
+                        val name = if (nameIdx >= 0) cursor.getString(nameIdx) else continue
+                        val mime = if (mimeIdx >= 0) cursor.getString(mimeIdx) else ""
+                        if (mime == DocumentsContract.Document.MIME_TYPE_DIR) continue
+                        if (name.startsWith(".")) continue
+                        val ext = name.substringAfterLast('.', "").lowercase(Locale.ROOT)
+                        if (ext in IGNORED_EXTENSIONS) continue
+                        val lastMod = if (modIdx >= 0) cursor.getLong(modIdx) else 0L
+                        val sizeBytes = if (sizeIdx >= 0) cursor.getLong(sizeIdx) else 0L
+                        if (sizeBytes <= 0L) continue
+                        if (lastMod > 0L && lastMod < cutoffMillis) continue
+
+                        val docUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, childId)
+                        val dedupKey = "saf|$docUri|$sizeBytes|$lastMod"
+                        val alreadyHandled = RuntimeStateStore.isAlreadyHandled(context, dedupKey)
+                        if (alreadyHandled && !includeAlreadyHandledInPending) continue
+
+                        val (targetDir, matchedLabel) = DefaultRuleRepository.resolveTargetDir(
+                            matchedRule,
+                            name,
+                            RuntimeStateStore.smartClassifyEnabled,
+                            RuntimeStateStore.smartGroupByApp
+                        )
+                        val action = matchedRule?.action ?: RouteAction.PROMPT
+                        when (action) {
+                            RouteAction.AUTO_MOVE, RouteAction.AUTO_COPY -> {
+                                if (!alreadyHandled) {
+                                    val finalName = DefaultRuleRepository.formatFileName(
+                                        matchedRule?.renamePattern ?: "{name}",
+                                        inferredApp,
+                                        name
+                                    )
+                                    val ok = relocateFile(
+                                        context = context,
+                                        sourcePath = null,
+                                        sharedUri = docUri,
+                                        appName = inferredApp,
+                                        fileName = finalName,
+                                        targetDirPath = targetDir,
+                                        copyOnly = true,
+                                        mode = "auto_rule"
+                                    )
+                                    if (ok) {
+                                        RuntimeStateStore.markHandled(context, dedupKey)
+                                        handled++
+                                    }
+                                }
+                            }
+                            RouteAction.PROMPT -> {
+                                val item = DetectedDownloadItem(
+                                    id = "saf_${docUri.toString().hashCode()}_$lastMod",
+                                    ruleId = matchedRule?.id ?: "saf_chat",
+                                    appName = inferredApp,
+                                    fileName = name,
+                                    sourcePath = docUri.toString(),
+                                    fileSizeBytes = sizeBytes,
+                                    suggestedTargetDir = targetDir,
+                                    matchedLabel = matchedLabel ?: "SAF 聊天目录",
+                                    detectedAtText = DefaultRuleRepository.nowTimeText()
+                                )
+                                RuntimeStateStore.addOrUpdatePending(item)
+                                if (!alreadyHandled) {
+                                    RuntimeStateStore.markHandled(context, dedupKey)
+                                    if (notifyUser) {
+                                        val virtualFile = File("/storage/emulated/0/Download/WeiXin/$name")
+                                        NotificationHelper.postNewFileHeadsUp(context, inferredApp, virtualFile, targetDir)
+                                    }
+                                    handled++
+                                }
+                            }
+                            RouteAction.IGNORE -> Unit
+                        }
+                    }
+                }
+            }
+        }
+        return handled
     }
 
     private fun queryMediaStoreRecent(

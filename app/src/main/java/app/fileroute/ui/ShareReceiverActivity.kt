@@ -49,8 +49,35 @@ class ShareReceiverActivity : ComponentActivity() {
         }
 
         val directFilePath = intent.getStringExtra(DownloadMonitorService.EXTRA_SOURCE_PATH)
+        val referrerHost = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.LOLLIPOP_MR1) {
+            referrer?.host.orEmpty()
+        } else ""
+        val uriSignature = (sharedUris.firstOrNull()?.toString().orEmpty() + " " + referrerHost).lowercase()
+        val matchedShareRule = RuntimeStateStore.rules.firstOrNull { r ->
+            when {
+                uriSignature.contains("tencent.mm") || uriSignature.contains("micromsg") || uriSignature.contains("weixin") ->
+                    r.packageName == "com.tencent.mm"
+                uriSignature.contains("mobileqq") || uriSignature.contains("qqfile") ->
+                    r.packageName == "com.tencent.mobileqq"
+                uriSignature.contains("tencent.tim") ->
+                    r.packageName == "com.tencent.tim"
+                uriSignature.contains("rimet") || uriSignature.contains("dingtalk") ->
+                    r.packageName == "com.alibaba.android.rimet"
+                uriSignature.contains("lark") || uriSignature.contains("feishu") ->
+                    r.packageName == "com.ss.android.lark"
+                else -> false
+            }
+        }
         val sourceApp = intent.getStringExtra(DownloadMonitorService.EXTRA_APP_NAME)
-            ?: if (sharedUris.isNotEmpty()) "QQ / 系统分享传入" else "未知来源"
+            ?: when {
+                uriSignature.contains("tencent.mm") || uriSignature.contains("micromsg") || uriSignature.contains("weixin") -> "微信（聊天文件）"
+                uriSignature.contains("mobileqq") || uriSignature.contains("qqfile") -> "QQ（聊天文件）"
+                uriSignature.contains("tencent.tim") -> "TIM（聊天文件）"
+                uriSignature.contains("rimet") || uriSignature.contains("dingtalk") -> "钉钉"
+                uriSignature.contains("lark") || uriSignature.contains("feishu") -> "飞书"
+                sharedUris.isNotEmpty() -> "系统分享 / 打开传入"
+                else -> "未知来源"
+            }
         val primaryName = directFilePath?.let { File(it).name }
             ?: sharedUris.firstOrNull()?.let { resolveDisplayName(it) }
             ?: "未命名文件"
@@ -61,13 +88,56 @@ class ShareReceiverActivity : ComponentActivity() {
         }
 
         val autoTarget = DefaultRuleRepository.resolveTargetDir(
-            rule = null,
+            rule = matchedShareRule,
             fileName = primaryName,
             smartClassifyEnabled = RuntimeStateStore.smartClassifyEnabled,
             smartGroupByApp = RuntimeStateStore.smartGroupByApp
         ).first
         val initialSuggested = intent.getStringExtra(DownloadMonitorService.EXTRA_SUGGESTED_DIR)
             ?: autoTarget
+
+        // 若已开启「微信/QQ「用其他应用打开」直接静默归位」，零点击直接按后缀归位并返回聊天窗口
+        if (directFilePath == null && sharedUris.isNotEmpty() && RuntimeStateStore.quickSilentShareArchive) {
+            var successCount = 0
+            var lastTarget = initialSuggested
+            for (uri in sharedUris) {
+                val rawName = resolveDisplayName(uri)
+                val targetDir = DefaultRuleRepository.resolveTargetDir(
+                    rule = matchedShareRule,
+                    fileName = rawName,
+                    smartClassifyEnabled = RuntimeStateStore.smartClassifyEnabled,
+                    smartGroupByApp = RuntimeStateStore.smartGroupByApp
+                ).first
+                val finalName = DefaultRuleRepository.formatFileName(
+                    matchedShareRule?.renamePattern ?: "{name}",
+                    sourceApp,
+                    rawName
+                )
+                val ok = DownloadDiscoveryEngine.relocateFile(
+                    context = applicationContext,
+                    sourcePath = null,
+                    sharedUri = uri,
+                    appName = sourceApp,
+                    fileName = finalName,
+                    targetDirPath = targetDir,
+                    copyOnly = true,
+                    conflictStrategy = "rename_timestamp",
+                    mode = "share_saved"
+                )
+                if (ok) {
+                    successCount++
+                    lastTarget = targetDir
+                }
+            }
+            Toast.makeText(
+                this,
+                if (successCount > 0) "已一键静默归位 $successCount 个${sourceApp}至 $lastTarget"
+                else "保存失败，请先授予所有文件访问权限",
+                Toast.LENGTH_SHORT
+            ).show()
+            finish()
+            return
+        }
 
         setContent {
             MaterialTheme {
@@ -82,8 +152,12 @@ class ShareReceiverActivity : ComponentActivity() {
                     primaryName,
                     RuntimeStateStore.integrityCheckEnabled
                 ) {
-                    if (existingConflict != null && RuntimeStateStore.integrityCheckEnabled && directFilePath != null) {
-                        DownloadDiscoveryEngine.isIdenticalFile(File(directFilePath), existingConflict)
+                    if (existingConflict != null && RuntimeStateStore.integrityCheckEnabled) {
+                        when {
+                            directFilePath != null -> DownloadDiscoveryEngine.isIdenticalFile(File(directFilePath), existingConflict)
+                            sharedUris.size == 1 -> DownloadDiscoveryEngine.isIdenticalUriToFile(applicationContext, sharedUris.first(), existingConflict)
+                            else -> false
+                        }
                     } else {
                         false
                     }
@@ -210,6 +284,21 @@ class ShareReceiverActivity : ComponentActivity() {
                                     RuntimeStateStore.updateSettings(context = applicationContext, integrityCheck = it)
                                 }
                             )
+                        }
+
+                        if (sharedUris.isNotEmpty() && directFilePath == null) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween
+                            ) {
+                                Text("下次从微信/QQ打开时直接静默归位")
+                                Switch(
+                                    checked = RuntimeStateStore.quickSilentShareArchive,
+                                    onCheckedChange = {
+                                        RuntimeStateStore.updateSettings(context = applicationContext, quickSilentShare = it)
+                                    }
+                                )
+                            }
                         }
 
                         if (directFilePath != null) {
