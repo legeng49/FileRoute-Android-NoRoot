@@ -35,6 +35,9 @@ class ShareReceiverActivity : ComponentActivity() {
         enableEdgeToEdge()
         super.onCreate(savedInstanceState)
         RuntimeStateStore.ensureInit(applicationContext)
+        if (RuntimeStateStore.shizukuEnabled) {
+            app.fileroute.shizuku.ShizukuPrivateDirBridge.init(applicationContext)
+        }
 
         val sharedUris: List<Uri> = when (intent.action) {
             Intent.ACTION_SEND -> listOfNotNull(

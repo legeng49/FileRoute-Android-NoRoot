@@ -77,6 +77,7 @@ import android.os.Looper
 import android.provider.DocumentsContract
 import java.io.File
 import java.util.concurrent.Executors
+import app.fileroute.shizuku.ShizukuPrivateDirBridge
 import app.fileroute.update.GitHubReleaseInfo
 import app.fileroute.update.GitHubReleaseUpdater
 import app.fileroute.worker.DownloadTriggerWorker
@@ -106,6 +107,7 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         RuntimeStateStore.ensureInit(applicationContext)
         NotificationHelper.ensureChannels(applicationContext)
+        ShizukuPrivateDirBridge.init(applicationContext)
         setContent {
             MaterialTheme(colorScheme = FileRouteColorScheme) {
                 Surface(
@@ -116,6 +118,11 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        ShizukuPrivateDirBridge.refreshState(applicationContext)
     }
 }
 
@@ -786,6 +793,36 @@ private fun MonitorHomeTab(
                                 }
                             }
                         )
+                        if (RuntimeStateStore.shizukuEnabled) {
+                            HorizontalDivider(color = Color(0xFFF1F5F9))
+                            val shizukuReady = ShizukuPrivateDirBridge.binderAlive &&
+                                ShizukuPrivateDirBridge.permissionGranted &&
+                                ShizukuPrivateDirBridge.serviceBound
+                            PermissionActionRow(
+                                title = "4. Shizuku 微信/QQ 聊天直采（可选）",
+                                subtitle = ShizukuPrivateDirBridge.statusText,
+                                granted = shizukuReady,
+                                actionText = when {
+                                    !ShizukuPrivateDirBridge.binderAlive -> "打开 Shizuku"
+                                    !ShizukuPrivateDirBridge.permissionGranted -> "授权 Shizuku"
+                                    else -> "连接通道"
+                                },
+                                onClick = {
+                                    ShizukuPrivateDirBridge.refreshState(context)
+                                    when {
+                                        !ShizukuPrivateDirBridge.binderAlive -> {
+                                            ShizukuPrivateDirBridge.openShizukuApp(context)
+                                        }
+                                        !ShizukuPrivateDirBridge.permissionGranted -> {
+                                            ShizukuPrivateDirBridge.requestPermission(context)
+                                        }
+                                        else -> {
+                                            ShizukuPrivateDirBridge.bindService(context)
+                                        }
+                                    }
+                                }
+                            )
+                        }
                     }
                 }
             }
@@ -888,10 +925,14 @@ private fun MonitorHomeTab(
                                     RuntimeStateStore.updateSettings(context, armed = false)
                                     Toast.makeText(context, "已停止下载守护", Toast.LENGTH_SHORT).show()
                                 } else {
-                                    if (RuntimeStateStore.useEventTriggeredMode) {
+                                    val needsShizukuLiveWatcher = RuntimeStateStore.shizukuEnabled && ShizukuPrivateDirBridge.isReady()
+                                    if (RuntimeStateStore.useEventTriggeredMode && !needsShizukuLiveWatcher) {
                                         context.stopService(svcIntent)
                                         DownloadTriggerWorker.scheduleNextTrigger(context)
                                     } else {
+                                        if (RuntimeStateStore.useEventTriggeredMode) {
+                                            DownloadTriggerWorker.scheduleNextTrigger(context)
+                                        }
                                         runCatching {
                                             context.startForegroundService(svcIntent)
                                         }.onFailure {
@@ -900,7 +941,12 @@ private fun MonitorHomeTab(
                                         }
                                     }
                                     RuntimeStateStore.updateSettings(context, armed = true)
-                                    Toast.makeText(context, "免 Root 守护已开启", Toast.LENGTH_SHORT).show()
+                                    Toast.makeText(
+                                        context,
+                                        if (needsShizukuLiveWatcher) "守护已开启（含 Shizuku 微信/QQ 聊天私有目录实时监听）"
+                                        else "免 Root 守护已开启",
+                                        Toast.LENGTH_SHORT
+                                    ).show()
                                 }
                             },
                             modifier = Modifier.weight(1f).height(46.dp)
@@ -1349,6 +1395,26 @@ private fun RulesManageTab(
                             modifier = Modifier.weight(1f)
                         ) {
                             Text("云端 / 本地导入")
+                        }
+                    }
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        OutlinedButton(
+                            onClick = {
+                                val moved = RuntimeStateStore.sortRulesByPathDepth(context)
+                                DownloadMonitorService.reloadIfRunning(context)
+                                Toast.makeText(
+                                    context,
+                                    if (moved > 0) "已按路径深度从深到浅重排并保存 $moved 条规则，防止父目录拦截"
+                                    else "全部规则已按路径深度从深到浅有序排列",
+                                    Toast.LENGTH_LONG
+                                ).show()
+                            },
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Text("按路径深度重排（防父目录拦截）")
                         }
                     }
                 }
@@ -2647,6 +2713,7 @@ private fun SettingsManageTab(
             var isAuditingHealth by remember { mutableStateOf(false) }
             var missingPaths by remember { mutableStateOf<List<Pair<String, String>>>(emptyList()) }
             var dupExts by remember { mutableStateOf<List<Pair<String, List<String>>>>(emptyList()) }
+            var sameTargetGroups by remember { mutableStateOf<List<Triple<String, List<String>, List<String>>>>(emptyList()) }
             var totalPathsChecked by remember { mutableStateOf(0) }
             var targetDirCount by remember { mutableStateOf(0) }
             var targetTotalBytes by remember { mutableStateOf(0L) }
@@ -2663,6 +2730,7 @@ private fun SettingsManageTab(
                     val missing = mutableListOf<Pair<String, String>>()
                     var totalPaths = 0
                     val extOwners = linkedMapOf<String, MutableList<String>>()
+                    val dirBuckets = linkedMapOf<String, Pair<String, MutableList<Pair<String, List<String>>>>>()
                     val targetDirs = linkedSetOf<String>()
 
                     snapshotRules.forEach { rule ->
@@ -2681,15 +2749,31 @@ private fun SettingsManageTab(
                                 targetDirs.add(DefaultRuleRepository.ensureTrailingSlash(sub.targetDir))
                             }
                         }
-                        if (rule.enabled && rule.action != RouteAction.IGNORE) {
+                        if (rule.action != RouteAction.IGNORE) {
                             rule.subRules.forEach { sub ->
-                                sub.extensions.forEach { ext ->
-                                    val clean = ext.trim().lowercase().removePrefix(".")
-                                    if (clean.isNotEmpty()) {
+                                val cleanDir = DefaultRuleRepository.ensureTrailingSlash(sub.targetDir)
+                                val cleanExts = sub.extensions.map { it.trim().lowercase().removePrefix(".") }.filter { it.isNotEmpty() }.distinct()
+                                if (cleanExts.isNotEmpty()) {
+                                    val dirEntry = dirBuckets.getOrPut(cleanDir.lowercase()) { cleanDir to mutableListOf() }
+                                    dirEntry.second.add(rule.appName to cleanExts)
+                                    cleanExts.forEach { clean ->
                                         val list = extOwners.getOrPut(clean) { mutableListOf() }
-                                        list.add("${rule.appName}→${sub.targetDir}")
+                                        list.add("${rule.appName}→${cleanDir}")
                                     }
                                 }
+                            }
+                        }
+                    }
+
+                    val mergeableDirs = mutableListOf<Triple<String, List<String>, List<String>>>()
+                    dirBuckets.values.forEach { (displayDir, items) ->
+                        if (items.size >= 2) {
+                            val extCount = linkedMapOf<String, Int>()
+                            items.forEach { (_, exts) -> exts.forEach { e -> extCount[e] = (extCount[e] ?: 0) + 1 } }
+                            val overlaps = extCount.filterValues { it >= 2 }.keys.toList()
+                            val uniqueApps = items.map { it.first }.distinct()
+                            if (overlaps.isNotEmpty() || uniqueApps.size == 1) {
+                                mergeableDirs.add(Triple(displayDir, overlaps, uniqueApps))
                             }
                         }
                     }
@@ -2725,6 +2809,7 @@ private fun SettingsManageTab(
                         totalPathsChecked = totalPaths
                         missingPaths = missing
                         dupExts = extOwners.entries.filter { it.value.size > 1 }.map { it.key to it.value }
+                        sameTargetGroups = mergeableDirs
                         targetDirCount = targetDirs.size
                         targetTotalBytes = sumBytes
                         targetTotalFiles = sumFiles
@@ -2751,8 +2836,9 @@ private fun SettingsManageTab(
                         Column(modifier = Modifier.weight(1f)) {
                             Text("规则健康度与存储空间分析", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
                             Text(
-                                if (!healthChecked) "展开查看路径存在性、重复后缀与目标目录体积占比"
-                                else "目标已存 ${DefaultRuleRepository.formatSize(targetTotalBytes)} · ${missingPaths.size} 缺失 · ${dupExts.size} 重复后缀",
+                                if (!healthChecked) "展开查看路径存在性、重复后缀合并建议与目标目录体积占比"
+                                else "目标已存 ${DefaultRuleRepository.formatSize(targetTotalBytes)} · ${missingPaths.size} 缺失 · ${dupExts.size} 重复后缀" +
+                                    (if (sameTargetGroups.isNotEmpty()) " · ${sameTargetGroups.size} 组可合并" else ""),
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
@@ -2769,7 +2855,24 @@ private fun SettingsManageTab(
                             .filter { it.severity == "shadowed" || it.severity == "exact_duplicate" }
                         HorizontalDivider(color = Color(0xFFF1F5F9))
                         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            if (pathConflictsNow.isNotEmpty() || dupExts.isNotEmpty()) {
+                            if (sameTargetGroups.isNotEmpty()) {
+                                Button(
+                                    enabled = !isAuditingHealth,
+                                    onClick = {
+                                        val (groups, removed, subs) = RuntimeStateStore.mergeSameTargetDuplicateRules(context)
+                                        DownloadMonitorService.reloadIfRunning(context)
+                                        runNativeHealthAudit()
+                                        Toast.makeText(
+                                            context,
+                                            if (groups > 0) "已合并 $groups 组同目标重复规则（折叠 $subs 条子规则，精简 $removed 条规则）"
+                                            else "当前无相同目标目录的重复规则",
+                                            Toast.LENGTH_LONG
+                                        ).show()
+                                    }
+                                ) {
+                                    Text("建议合并 (${sameTargetGroups.size})")
+                                }
+                            } else if (pathConflictsNow.isNotEmpty() || dupExts.isNotEmpty()) {
                                 Button(
                                     enabled = !isAuditingHealth,
                                     onClick = {
@@ -2806,7 +2909,7 @@ private fun SettingsManageTab(
                                         color = Color(0xFF92400E)
                                     )
                                     Text(
-                                        "点击上方「一键修复」将按路径深度从深到浅自动重排优先级。",
+                                        "点击上方修复按钮将按路径深度从深到浅自动重排优先级。",
                                         style = MaterialTheme.typography.labelSmall,
                                         color = MaterialTheme.colorScheme.onSurfaceVariant
                                     )
@@ -2837,6 +2940,47 @@ private fun SettingsManageTab(
                                 }
                             }
 
+                            sameTargetGroups.forEach { (targetDir, overlaps, apps) ->
+                                Surface(color = Color(0xFFEFF6FF), shape = RoundedCornerShape(10.dp)) {
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth().padding(10.dp),
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Column(modifier = Modifier.weight(1f).padding(end = 8.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                                            Text(
+                                                "同目标重复规则 · ${targetDir.removePrefix("/storage/emulated/0")}",
+                                                style = MaterialTheme.typography.labelMedium,
+                                                fontWeight = FontWeight.SemiBold,
+                                                color = Color(0xFF1D4ED8)
+                                            )
+                                            Text(
+                                                "涉及 ${apps.joinToString("、")}" +
+                                                    (if (overlaps.isNotEmpty()) " · 重复 ${overlaps.joinToString(" ") { ".$it" }}" else ""),
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                                            )
+                                        }
+                                        TextButton(
+                                            onClick = {
+                                                val (groups, removed, subs) = RuntimeStateStore.mergeSameTargetDuplicateRules(context, targetDir)
+                                                DownloadMonitorService.reloadIfRunning(context)
+                                                runNativeHealthAudit()
+                                                if (groups > 0) {
+                                                    Toast.makeText(
+                                                        context,
+                                                        "已合并同目标规则（折叠 $subs 条子规则，精简 $removed 条规则）",
+                                                        Toast.LENGTH_SHORT
+                                                    ).show()
+                                                }
+                                            }
+                                        ) {
+                                            Text("建议合并", fontWeight = FontWeight.SemiBold)
+                                        }
+                                    }
+                                }
+                            }
+
                             missingPaths.take(4).forEach { (app, path) ->
                                 Surface(color = Color(0xFFFEF2F2), shape = RoundedCornerShape(10.dp)) {
                                     Column(modifier = Modifier.fillMaxWidth().padding(10.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
@@ -2849,11 +2993,11 @@ private fun SettingsManageTab(
                                 Surface(color = Color(0xFFFFFBEB), shape = RoundedCornerShape(10.dp)) {
                                     Column(modifier = Modifier.fillMaxWidth().padding(10.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
                                         Text("重复后缀 .${ext}（${owners.size} 条子规则）", style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.SemiBold, color = Color(0xFF92400E))
-                                        Text("建议合并或增加筛选：${owners.joinToString(" / ")}", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                        Text("命中规则：${owners.joinToString(" / ")}", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                                     }
                                 }
                             }
-                            if (missingPaths.isEmpty() && dupExts.isEmpty()) {
+                            if (missingPaths.isEmpty() && dupExts.isEmpty() && sameTargetGroups.isEmpty()) {
                                 Text("全部 $totalPathsChecked 条路径有效，且无重复后缀冲突。", style = MaterialTheme.typography.bodySmall, color = Color(0xFF0F766E))
                             }
                         }
@@ -3008,6 +3152,115 @@ private fun SettingsManageTab(
                             OutlinedButton(onClick = { confirmReset = true }) {
                                 Text("恢复默认设置")
                             }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 可选 Shizuku 增强通道设置卡片（微信/QQ 聊天私有目录直采）
+        item {
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(16.dp),
+                colors = CardDefaults.cardColors(containerColor = Color.White),
+                border = BorderStroke(1.dp, Color(0xFFE2E8F0))
+            ) {
+                Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Text(
+                        "微信 / QQ 聊天私有目录直采（可选 Shizuku）",
+                        style = MaterialTheme.typography.titleSmall,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                    Text(
+                        "开启后借助 Shizuku 直接实时监听 /Android/data/com.tencent.mm/MicroMsg/Download/ 等私有目录，微信聊天点下文件即自动触发归位；未启动 Shizuku 时自动回退公共目录模式。",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text("启用 Shizuku 私有目录实时监听", style = MaterialTheme.typography.bodyMedium)
+                        Switch(
+                            checked = RuntimeStateStore.shizukuEnabled,
+                            onCheckedChange = { enabled ->
+                                RuntimeStateStore.updateSettings(context, shizuku = enabled)
+                                if (enabled) {
+                                    ShizukuPrivateDirBridge.init(context)
+                                    if (ShizukuPrivateDirBridge.binderAlive && !ShizukuPrivateDirBridge.permissionGranted) {
+                                        ShizukuPrivateDirBridge.requestPermission(context)
+                                    } else if (ShizukuPrivateDirBridge.isReady() && RuntimeStateStore.guardArmed) {
+                                        runCatching {
+                                            context.startForegroundService(Intent(context, DownloadMonitorService::class.java))
+                                        }
+                                    }
+                                } else {
+                                    ShizukuPrivateDirBridge.unbindService()
+                                }
+                            }
+                        )
+                    }
+                    Text(
+                        "当前状态：${ShizukuPrivateDirBridge.statusText}",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = if (ShizukuPrivateDirBridge.isReady()) Color(0xFF0F766E) else MaterialTheme.colorScheme.onSurfaceVariant,
+                        fontWeight = FontWeight.Medium
+                    )
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Button(
+                            onClick = {
+                                ShizukuPrivateDirBridge.refreshState(context)
+                                when {
+                                    !ShizukuPrivateDirBridge.binderAlive -> {
+                                        ShizukuPrivateDirBridge.openShizukuApp(context)
+                                    }
+                                    !ShizukuPrivateDirBridge.permissionGranted -> {
+                                        ShizukuPrivateDirBridge.requestPermission(context)
+                                    }
+                                    !ShizukuPrivateDirBridge.serviceBound -> {
+                                        ShizukuPrivateDirBridge.bindService(context)
+                                    }
+                                    else -> {
+                                        val executor = Executors.newSingleThreadExecutor()
+                                        val mainHandler = Handler(Looper.getMainLooper())
+                                        executor.execute {
+                                            val count = DownloadDiscoveryEngine.scanShizukuPrivateDirs(
+                                                context = context,
+                                                cutoffMillis = System.currentTimeMillis() - 24 * 60 * 60_000L,
+                                                notifyUser = false,
+                                                includeAlreadyHandledInPending = true
+                                            )
+                                            mainHandler.post {
+                                                Toast.makeText(
+                                                    context,
+                                                    "Shizuku 微信/QQ 聊天目录扫描完成：新增 $count 个待归位文件",
+                                                    Toast.LENGTH_LONG
+                                                ).show()
+                                            }
+                                            executor.shutdown()
+                                        }
+                                    }
+                                }
+                            }
+                        ) {
+                            Text(
+                                when {
+                                    !ShizukuPrivateDirBridge.binderAlive -> "打开 Shizuku"
+                                    !ShizukuPrivateDirBridge.permissionGranted -> "授权 Shizuku"
+                                    !ShizukuPrivateDirBridge.serviceBound -> "连接服务"
+                                    else -> "立即扫描聊天目录"
+                                }
+                            )
+                        }
+                        OutlinedButton(
+                            onClick = {
+                                ShizukuPrivateDirBridge.refreshState(context)
+                                Toast.makeText(context, ShizukuPrivateDirBridge.statusText, Toast.LENGTH_SHORT).show()
+                            }
+                        ) {
+                            Text("刷新状态")
                         }
                     }
                 }

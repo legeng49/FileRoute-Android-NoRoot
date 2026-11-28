@@ -37,6 +37,7 @@ object RuntimeStateStore {
     private const val KEY_IGNORED_UPDATE_TAG = "ignored_update_tag"
     private const val KEY_QUICK_SILENT_SHARE = "quick_silent_share_archive"
     private const val KEY_SAF_TREE_URIS = "saf_tree_uris"
+    private const val KEY_SHIZUKU_ENABLED = "shizuku_enabled"
 
     private val mainHandler = Handler(Looper.getMainLooper())
 
@@ -72,6 +73,7 @@ object RuntimeStateStore {
     var githubUpdateRepo by mutableStateOf("legeng49/FileRoute-Android-NoRoot")
     var ignoredUpdateTag by mutableStateOf("")
     var quickSilentShareArchive by mutableStateOf(false)
+    var shizukuEnabled by mutableStateOf(true)
 
     private val handledKeys = linkedSetOf<String>()
 
@@ -94,6 +96,7 @@ object RuntimeStateStore {
             ?.takeIf { it.isNotBlank() } ?: "legeng49/FileRoute-Android-NoRoot"
         ignoredUpdateTag = prefs.getString(KEY_IGNORED_UPDATE_TAG, "") ?: ""
         quickSilentShareArchive = prefs.getBoolean(KEY_QUICK_SILENT_SHARE, false)
+        shizukuEnabled = prefs.getBoolean(KEY_SHIZUKU_ENABLED, true)
 
         safTreeUris.clear()
         prefs.getStringSet(KEY_SAF_TREE_URIS, emptySet())?.let { safTreeUris.addAll(it) }
@@ -493,7 +496,8 @@ object RuntimeStateStore {
         integrityCheck: Boolean = integrityCheckEnabled,
         autoCheckUpdate: Boolean = autoCheckUpdateEnabled,
         updateRepo: String = githubUpdateRepo,
-        quickSilentShare: Boolean = quickSilentShareArchive
+        quickSilentShare: Boolean = quickSilentShareArchive,
+        shizuku: Boolean = shizukuEnabled
     ) {
         ensureInit(context)
         universalScanEnabled = universal
@@ -509,6 +513,7 @@ object RuntimeStateStore {
         autoCheckUpdateEnabled = autoCheckUpdate
         githubUpdateRepo = updateRepo.trim().ifBlank { "legeng49/FileRoute-Android-NoRoot" }
         quickSilentShareArchive = quickSilentShare
+        shizukuEnabled = shizuku
         context.applicationContext.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
             .edit()
             .putBoolean(KEY_UNIVERSAL_SCAN, universal)
@@ -524,6 +529,7 @@ object RuntimeStateStore {
             .putBoolean(KEY_AUTO_CHECK_UPDATE, autoCheckUpdate)
             .putString(KEY_GITHUB_UPDATE_REPO, githubUpdateRepo)
             .putBoolean(KEY_QUICK_SILENT_SHARE, quickSilentShare)
+            .putBoolean(KEY_SHIZUKU_ENABLED, shizuku)
             .apply()
     }
 
@@ -676,6 +682,43 @@ object RuntimeStateStore {
     }
 
     /**
+     * 扫描全部规则的 sourcePaths，按目录路径深度从深到浅排序并持久化保存，
+     * 防止子目录规则被父目录规则拦截。返回位置发生变化的规则条数。
+     */
+    fun sortRulesByPathDepth(context: Context): Int {
+        ensureInit(context)
+        if (rules.size <= 1) return 0
+        fun pathDepth(raw: String): Int {
+            val trimmed = raw.trim()
+            if (trimmed.isEmpty() || trimmed.startsWith("content://")) return 0
+            return trimmed.trim('/').split('/').count { it.isNotBlank() }
+        }
+        val beforeOrder = rules.map { it.id }
+        val sorted = rules.map { r ->
+            r.copy(sourcePaths = r.sourcePaths.sortedByDescending { pathDepth(it) })
+        }.sortedWith(
+            compareByDescending<AppRouteRule> { r ->
+                r.sourcePaths.maxOfOrNull { pathDepth(it) } ?: 0
+            }.thenByDescending { r ->
+                r.sourcePaths.minOfOrNull { pathDepth(it) } ?: 0
+            }.thenByDescending { r ->
+                r.sourcePaths.filter { !it.trim().startsWith("content://") }
+                    .maxOfOrNull { DefaultRuleRepository.ensureTrailingSlash(it).length } ?: 0
+            }.thenBy { beforeOrder.indexOf(it.id) }
+        )
+        rules.clear()
+        rules.addAll(sorted)
+        optimizeRulePriorities(context)
+        val movedCount = rules.indices.count { rules[it].id != beforeOrder.getOrNull(it) }
+        saveCustomRules(context)
+        appendLog(
+            if (movedCount > 0) "已按路径深度从深到浅重排 $movedCount 条规则并保存，防止父目录拦截子目录"
+            else "已扫描全部 ${rules.size} 条规则路径，当前顺序已按深度从深到浅排列"
+        )
+        return movedCount
+    }
+
+    /**
      * 规则健康度一键修复：
      * 1) 存在路径冲突时按路径深度（从深到浅）自动重排公共目录监听规则优先级；
      * 2) 合并并去重多条规则中重复匹配的文件后缀与同目标子规则。
@@ -754,6 +797,133 @@ object RuntimeStateStore {
             appendLog("规则健康度一键修复完成：重排 $reorderedCount 条优先级 · 合并 ${mergedExts.size} 个重复后缀")
         }
         return reorderedCount to mergedExts.size
+    }
+
+    /**
+     * 将指向同一目标目录的重复后缀规则自动合并为一条：
+     * 优先保留排序靠前的规则作为主规则，去重并合并扩展名；若次要规则通道一致、无其他独立子规则且默认目录相同，
+     * 则合并其监听路径并精简为 1 条规则，否则移除次要规则中冗余的同目标子规则。
+     * 返回 Triple(合并分组数, 精简规则数, 折叠子规则数)
+     */
+    fun mergeSameTargetDuplicateRules(context: Context, onlyTargetDir: String? = null): Triple<Int, Int, Int> {
+        ensureInit(context)
+        fun norm(path: String) = DefaultRuleRepository.ensureTrailingSlash(path).lowercase()
+        val filterKey = onlyTargetDir?.takeIf { it.isNotBlank() }?.let { norm(it) }
+
+        val targetKeys = linkedSetOf<String>()
+        if (filterKey != null) {
+            targetKeys.add(filterKey)
+        } else {
+            val countsByDir = linkedMapOf<String, Int>()
+            rules.forEach { r ->
+                if (r.action == RouteAction.IGNORE) return@forEach
+                r.subRules.forEach { sub ->
+                    val k = norm(sub.targetDir)
+                    countsByDir[k] = (countsByDir[k] ?: 0) + 1
+                }
+            }
+            countsByDir.filterValues { it >= 2 }.keys.forEach { targetKeys.add(it) }
+        }
+
+        var mergedGroups = 0
+        var removedRules = 0
+        var mergedSubRules = 0
+
+        for (dirKey in targetKeys) {
+            val matchedIndices = mutableListOf<Int>()
+            val collectedExts = linkedSetOf<String>()
+            var displayDir = ""
+            var firstLabel = "合并后缀归类"
+            var matchedSubTotal = 0
+
+            rules.forEachIndexed { idx, r ->
+                if (r.action == RouteAction.IGNORE) return@forEachIndexed
+                val hits = r.subRules.filter { norm(it.targetDir) == dirKey }
+                if (hits.isNotEmpty()) {
+                    matchedIndices.add(idx)
+                    matchedSubTotal += hits.size
+                    hits.forEach { sub ->
+                        if (displayDir.isEmpty()) displayDir = DefaultRuleRepository.ensureTrailingSlash(sub.targetDir)
+                        if (firstLabel == "合并后缀归类" && sub.label.isNotBlank()) firstLabel = sub.label
+                        sub.extensions.forEach { raw ->
+                            val clean = raw.trim().lowercase().removePrefix(".")
+                            if (clean.isNotEmpty()) collectedExts.add(clean)
+                        }
+                    }
+                }
+            }
+
+            if (matchedSubTotal < 2 || matchedIndices.isEmpty() || collectedExts.isEmpty()) continue
+
+            val primaryIdx = matchedIndices.first()
+            val primary = rules[primaryIdx]
+            val primaryFirstSub = primary.subRules.firstOrNull { norm(it.targetDir) == dirKey }
+            val cleanBaseLabel = firstLabel.removeSuffix("（已合并）")
+            val consolidatedSub = ExtensionSubRule(
+                id = primaryFirstSub?.id ?: "sub_merged_${System.currentTimeMillis()}",
+                label = "${cleanBaseLabel}（已合并）",
+                extensions = collectedExts.toList(),
+                targetDir = displayDir
+            )
+
+            var inserted = false
+            val updatedPrimarySubs = mutableListOf<ExtensionSubRule>()
+            primary.subRules.forEach { sub ->
+                if (norm(sub.targetDir) == dirKey) {
+                    if (!inserted) {
+                        updatedPrimarySubs.add(consolidatedSub)
+                        inserted = true
+                    }
+                } else {
+                    updatedPrimarySubs.add(sub)
+                }
+            }
+
+            val mergedPaths = linkedSetOf<String>().apply { addAll(primary.sourcePaths) }
+            val absorbedNames = mutableListOf<String>()
+            val dropIds = hashSetOf<String>()
+
+            for (pos in 1 until matchedIndices.size) {
+                val secIdx = matchedIndices[pos]
+                val sec = rules[secIdx]
+                val remainingSubs = sec.subRules.filter { norm(it.targetDir) != dirKey }
+                val canAbsorbWhole =
+                    sec.channel == primary.channel &&
+                        remainingSubs.isEmpty() &&
+                        norm(sec.defaultTargetDir) == dirKey
+
+                if (canAbsorbWhole) {
+                    mergedPaths.addAll(sec.sourcePaths)
+                    if (!primary.appName.contains(sec.appName)) absorbedNames.add(sec.appName)
+                    dropIds.add(sec.id)
+                } else {
+                    rules[secIdx] = sec.copy(subRules = remainingSubs)
+                }
+            }
+
+            val nextPrimaryName =
+                if (absorbedNames.isNotEmpty()) "${primary.appName} / ${absorbedNames.joinToString(" / ")}"
+                else primary.appName
+
+            rules[primaryIdx] = primary.copy(
+                appName = nextPrimaryName,
+                sourcePaths = mergedPaths.toList(),
+                subRules = updatedPrimarySubs
+            )
+
+            if (dropIds.isNotEmpty()) {
+                rules.removeAll { it.id in dropIds }
+                removedRules += dropIds.size
+            }
+            mergedGroups += 1
+            mergedSubRules += (matchedSubTotal - 1).coerceAtLeast(1)
+        }
+
+        if (mergedGroups > 0) {
+            saveCustomRules(context)
+            appendLog("已合并 $mergedGroups 组同目标目录重复后缀规则（折叠 $mergedSubRules 条子规则，精简 $removedRules 条规则）")
+        }
+        return Triple(mergedGroups, removedRules, mergedSubRules)
     }
 
     fun moveRule(context: Context, index: Int, delta: Int): Boolean {

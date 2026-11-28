@@ -14,8 +14,8 @@ android {
         applicationId = "app.fileroute"
         minSdk = 26
         targetSdk = 37
-        versionCode = 6
-        versionName = "3.1.0-android17"
+        versionCode = 7
+        versionName = "3.2.0-android17"
     }
 
     buildTypes {
@@ -31,6 +31,7 @@ android {
 
     buildFeatures {
         compose = true
+        aidl = true
     }
 }
 
@@ -49,4 +50,7 @@ dependencies {
     implementation("androidx.compose.ui:ui")
     implementation("androidx.compose.material3:material3")
     implementation("androidx.compose.material:material-icons-core")
+    // 可选 Shizuku SDK（用于免 Root 读取微信/QQ Android/data 私有聊天目录）
+    implementation("dev.rikka.shizuku:api:13.1.5")
+    implementation("dev.rikka.shizuku:provider:13.1.5")
 }

@@ -19,6 +19,11 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
 
+    <!-- 允许检测并拉起可选 Shizuku 管理器（用于免 Root 直采微信/QQ Android/data 聊天私有目录） -->
+    <queries>
+        <package android:name="moe.shizuku.privileged.api" />
+    </queries>
+
     <supports-screens
         android:smallScreens="true"
         android:normalScreens="true"
@@ -35,6 +40,15 @@
         android:resizeableActivity="true"
         android:supportsRtl="true"
         android:theme="@android:style/Theme.Material.Light.NoActionBar">
+
+        <!-- 可选 Shizuku 官方 Provider：仅在设备安装并启动 Shizuku 时生效，未安装时完全无影响 -->
+        <provider
+            android:name="rikka.shizuku.ShizukuProvider"
+            android:authorities="${applicationId}.shizuku"
+            android:multiprocess="false"
+            android:enabled="true"
+            android:exported="true"
+            android:permission="android.permission.INTERACT_ACROSS_USERS_FULL" />
 
         <!-- FileProvider：用于 GitHub Releases 自动下载 APK 后调起系统安装器 -->
         <provider

@@ -16,13 +16,16 @@ import app.fileroute.data.RecentMediaSample
 import app.fileroute.data.RouteAction
 import app.fileroute.data.RuntimeStateStore
 import app.fileroute.data.TransferHistoryItem
+import app.fileroute.shizuku.ShizukuPrivateDirBridge
 import java.io.File
 import java.net.URLDecoder
 import java.util.Locale
+import java.util.concurrent.ConcurrentHashMap
 
 object DownloadDiscoveryEngine {
 
     private val IGNORED_EXTENSIONS = setOf("tmp", "crdownload", "part", "download", "pending", "bak")
+    private val shizukuStabilityMap = ConcurrentHashMap<String, Pair<Long, Long>>()
 
     fun buildWeChatChatSafInitialUri(): Uri {
         return Uri.parse(
@@ -84,6 +87,12 @@ object DownloadDiscoveryEngine {
         }
 
         var newlyHandledCount = scanSafAuthorizedTrees(
+            context = context,
+            cutoffMillis = cutoffMillis,
+            notifyUser = notifyUser,
+            includeAlreadyHandledInPending = includeAlreadyHandledInPending
+        )
+        newlyHandledCount += scanShizukuPrivateDirs(
             context = context,
             cutoffMillis = cutoffMillis,
             notifyUser = notifyUser,
@@ -175,6 +184,136 @@ object DownloadDiscoveryEngine {
             RuntimeStateStore.appendLog("本次扫描发现 $newlyHandledCount 个新下载文件")
         }
         return newlyHandledCount
+    }
+
+    /**
+     * Layer D: 可选 Shizuku 特权通道扫描微信 / QQ / TIM / 钉钉 / 飞书 Android/data 私有聊天目录
+     * （自带落盘大小稳定性防抖，确保聊天中点击下载的 PDF 完全写入后再触发归位或顶部横幅）
+     */
+    fun scanShizukuPrivateDirs(
+        context: Context,
+        cutoffMillis: Long = System.currentTimeMillis() - 15 * 60_000L,
+        notifyUser: Boolean = true,
+        includeAlreadyHandledInPending: Boolean = false
+    ): Int {
+        if (!RuntimeStateStore.shizukuEnabled || !ShizukuPrivateDirBridge.isReady()) return 0
+        val entries = ShizukuPrivateDirBridge.scanPrivateChatDirs(context, cutoffMillis)
+        if (entries.isEmpty()) return 0
+
+        val now = System.currentTimeMillis()
+        val verifyDelayMs = RuntimeStateStore.writeVerifyDelayMs.coerceAtLeast(800L)
+        var handled = 0
+
+        for (entry in entries) {
+            if (entry.path.isBlank() || entry.name.isBlank() || entry.size <= 0L) continue
+            if (isInsideManagedTargetArchive(entry.path)) continue
+
+            val dedupKey = "${entry.path}|${entry.size}|${entry.lastModified}"
+            val alreadyHandled = RuntimeStateStore.isAlreadyHandled(context, dedupKey)
+            if (alreadyHandled && !includeAlreadyHandledInPending) continue
+
+            // 写入稳定性校验：刚落盘不足防抖时长的文件需等待连续两次大小一致再处理，避免截断未下完的 PDF
+            val prevSeen = shizukuStabilityMap[entry.path]
+            val ageMs = now - entry.lastModified
+            if (ageMs < verifyDelayMs) {
+                if (prevSeen == null || prevSeen.first != entry.size) {
+                    shizukuStabilityMap[entry.path] = entry.size to now
+                    continue
+                }
+            }
+            shizukuStabilityMap.remove(entry.path)
+
+            val lowerPath = entry.path.lowercase(Locale.ROOT)
+            val inferredPkg = when {
+                lowerPath.contains("com.tencent.mm") -> "com.tencent.mm"
+                lowerPath.contains("com.tencent.mobileqq") -> "com.tencent.mobileqq"
+                lowerPath.contains("com.tencent.tim") -> "com.tencent.tim"
+                lowerPath.contains("com.alibaba.android.rimet") -> "com.alibaba.android.rimet"
+                lowerPath.contains("com.ss.android.lark") -> "com.ss.android.lark"
+                else -> null
+            }
+
+            val matchedRule = DefaultRuleRepository.matchRuleForFile(
+                RuntimeStateStore.rules,
+                entry.path,
+                inferredPkg
+            ) ?: RuntimeStateStore.rules.firstOrNull {
+                it.enabled && inferredPkg != null && it.packageName.equals(inferredPkg, ignoreCase = true)
+            }
+
+            val appName = when (inferredPkg) {
+                "com.tencent.mm" -> "微信（聊天文件）"
+                "com.tencent.mobileqq" -> "QQ（聊天文件）"
+                "com.tencent.tim" -> "TIM（聊天文件）"
+                else -> DefaultRuleRepository.inferAppLabel(entry.path, inferredPkg, matchedRule)
+            }
+
+            val (targetDir, matchedLabel) = DefaultRuleRepository.resolveTargetDir(
+                matchedRule,
+                entry.name,
+                RuntimeStateStore.smartClassifyEnabled,
+                RuntimeStateStore.smartGroupByApp
+            )
+            val action = matchedRule?.action ?: RouteAction.PROMPT
+
+            when (action) {
+                RouteAction.AUTO_MOVE, RouteAction.AUTO_COPY -> {
+                    if (!alreadyHandled) {
+                        val copyOnly = action == RouteAction.AUTO_COPY
+                        val finalName = DefaultRuleRepository.formatFileName(
+                            matchedRule?.renamePattern ?: "{name}",
+                            appName,
+                            entry.name
+                        )
+                        val ok = relocateFile(
+                            context = context,
+                            sourcePath = entry.path,
+                            sharedUri = null,
+                            appName = appName,
+                            fileName = finalName,
+                            targetDirPath = targetDir,
+                            copyOnly = copyOnly,
+                            mode = "auto_rule"
+                        )
+                        if (ok) {
+                            RuntimeStateStore.markHandled(context, dedupKey)
+                            handled++
+                        }
+                    }
+                }
+                RouteAction.PROMPT -> {
+                    val item = DetectedDownloadItem(
+                        id = "shz_${entry.path.hashCode()}_${entry.lastModified}",
+                        ruleId = matchedRule?.id ?: "shizuku_chat",
+                        appName = appName,
+                        fileName = entry.name,
+                        sourcePath = entry.path,
+                        fileSizeBytes = entry.size,
+                        suggestedTargetDir = targetDir,
+                        matchedLabel = matchedLabel ?: "Shizuku 聊天直采",
+                        detectedAtText = DefaultRuleRepository.nowTimeText()
+                    )
+                    RuntimeStateStore.addOrUpdatePending(item)
+                    if (!alreadyHandled) {
+                        RuntimeStateStore.markHandled(context, dedupKey)
+                        if (notifyUser) {
+                            val posted = NotificationHelper.postNewFileHeadsUp(
+                                context,
+                                appName,
+                                File(entry.path),
+                                targetDir
+                            )
+                            RuntimeStateStore.appendLog(
+                                "Shizuku 捕获 [${appName}] ${entry.name} -> 通知${if (posted) "已弹出" else "未授权被拦截"}"
+                            )
+                        }
+                        handled++
+                    }
+                }
+                RouteAction.IGNORE -> Unit
+            }
+        }
+        return handled
     }
 
     /**
@@ -484,11 +623,19 @@ object DownloadDiscoveryEngine {
     }
 
     fun isIdenticalFile(srcFile: File, dstFile: File): Boolean {
-        if (!srcFile.exists() || !dstFile.exists() || !srcFile.isFile || !dstFile.isFile) return false
-        if (srcFile.length() != dstFile.length()) return false
-        val srcHash = computeSha256(srcFile) ?: return false
-        val dstHash = computeSha256(dstFile) ?: return false
-        return srcHash.equals(dstHash, ignoreCase = true)
+        if (!dstFile.exists() || !dstFile.isFile) return false
+        if (srcFile.exists() && srcFile.isFile && srcFile.canRead()) {
+            if (srcFile.length() != dstFile.length()) return false
+            val srcHash = computeSha256(srcFile) ?: return false
+            val dstHash = computeSha256(dstFile) ?: return false
+            return srcHash.equals(dstHash, ignoreCase = true)
+        }
+        if (srcFile.absolutePath.contains("/Android/data/", ignoreCase = true) && ShizukuPrivateDirBridge.isReady()) {
+            val srcHash = ShizukuPrivateDirBridge.computeSha256(srcFile.absolutePath) ?: return false
+            val dstHash = computeSha256(dstFile) ?: return false
+            return srcHash.equals(dstHash, ignoreCase = true)
+        }
+        return false
     }
 
     fun isIdenticalUriToFile(context: Context, uri: Uri, dstFile: File): Boolean {
@@ -569,12 +716,25 @@ object DownloadDiscoveryEngine {
 
             if (!sourcePath.isNullOrBlank()) {
                 val src = File(sourcePath)
-                if (!src.exists() || !src.isFile) return false
-                fileSize = src.length()
-                fromLabel = src.absolutePath
-                src.copyTo(uniqueTarget, overwrite = allowOverwrite)
-                if (!copyOnly) src.delete()
-                RuntimeStateStore.removePendingByPath(sourcePath)
+                if (src.exists() && src.isFile && src.canRead()) {
+                    fileSize = src.length()
+                    fromLabel = src.absolutePath
+                    src.copyTo(uniqueTarget, overwrite = allowOverwrite)
+                    if (!copyOnly) src.delete()
+                    RuntimeStateStore.removePendingByPath(sourcePath)
+                } else if (sourcePath.contains("/Android/data/", ignoreCase = true) && ShizukuPrivateDirBridge.isReady()) {
+                    fromLabel = sourcePath
+                    val transferred = ShizukuPrivateDirBridge.transferFile(
+                        sourcePath = sourcePath,
+                        targetPath = uniqueTarget.absolutePath,
+                        copyOnly = copyOnly
+                    )
+                    if (!transferred || !uniqueTarget.exists()) return false
+                    fileSize = uniqueTarget.length()
+                    RuntimeStateStore.removePendingByPath(sourcePath)
+                } else {
+                    return false
+                }
             } else if (sharedUri != null) {
                 fromLabel = sharedUri.toString()
                 context.contentResolver.openInputStream(sharedUri)?.use { input ->

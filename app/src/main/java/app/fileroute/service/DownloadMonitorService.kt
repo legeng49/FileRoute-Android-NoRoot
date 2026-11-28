@@ -11,10 +11,12 @@ import android.os.FileObserver
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.os.PowerManager
 import android.provider.MediaStore
 import app.fileroute.data.ChannelMode
 import app.fileroute.data.RouteAction
 import app.fileroute.data.RuntimeStateStore
+import app.fileroute.shizuku.ShizukuPrivateDirBridge
 import app.fileroute.util.DownloadDiscoveryEngine
 import app.fileroute.util.NotificationHelper
 import app.fileroute.worker.DownloadTriggerWorker
@@ -22,9 +24,9 @@ import java.io.File
 import java.util.concurrent.Executors
 
 /**
- * 实时守护前台服务（Android 17 / API 37 适配 · 免 Root / 免 Shizuku）
+ * 实时守护前台服务（Android 17 / API 37 适配 · 免 Root · 可选 Shizuku 微信/QQ 聊天私有目录实时监听）
  * 1. 同时挂载 Download 及所有子目录 FileObserver + MediaStore ContentObserver
- * 2. 即使不同手机 ROM 的微信/QQ路径不同，MediaStore 变动也会在 0.8 秒内触发扫描并弹出顶部横幅
+ * 2. 若已开启并授权 Shizuku，自动以亮屏 2.5s / 灭屏 12s 的极低功耗频率巡检微信/QQ Android/data 私有目录
  * 3. 达到 Android 15–17 dataSync 6 小时限额时自动无缝移交 WorkManager 触发器，永不崩溃
  */
 class DownloadMonitorService : Service() {
@@ -38,7 +40,8 @@ class DownloadMonitorService : Service() {
         const val EVENT_DEBOUNCE_MS = 900L
 
         fun reloadIfRunning(context: android.content.Context) {
-            if (!RuntimeStateStore.guardArmed || RuntimeStateStore.useEventTriggeredMode) return
+            if (!RuntimeStateStore.guardArmed) return
+            if (RuntimeStateStore.useEventTriggeredMode && !(RuntimeStateStore.shizukuEnabled && ShizukuPrivateDirBridge.isReady())) return
             val intent = Intent(context.applicationContext, DownloadMonitorService::class.java).apply {
                 action = ACTION_RELOAD_WATCHERS
             }
@@ -67,10 +70,30 @@ class DownloadMonitorService : Service() {
         }
     }
 
+    // 自适应 Shizuku 私有目录轻量巡检：亮屏 2.5 秒实时捕获微信聊天 PDF 下载，灭屏自动降频至 12 秒省电
+    private val shizukuPollTask: Runnable = object : Runnable {
+        override fun run() {
+            if (RuntimeStateStore.shizukuEnabled && ShizukuPrivateDirBridge.isReady()) {
+                ioExecutor.execute {
+                    DownloadDiscoveryEngine.scanShizukuPrivateDirs(
+                        context = applicationContext,
+                        cutoffMillis = System.currentTimeMillis() - 10 * 60_000L,
+                        notifyUser = true
+                    )
+                }
+            }
+            val pm = getSystemService(POWER_SERVICE) as? PowerManager
+            val interactive = pm?.isInteractive ?: true
+            val nextDelay = if (interactive) 2500L else 12000L
+            mainHandler.postDelayed(this, nextDelay)
+        }
+    }
+
     override fun onCreate() {
         super.onCreate()
         RuntimeStateStore.ensureInit(applicationContext)
         NotificationHelper.ensureChannels(applicationContext)
+        ShizukuPrivateDirBridge.init(applicationContext)
 
         val keepAliveNotif = NotificationHelper.buildKeepAliveNotification(applicationContext)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
@@ -80,10 +103,14 @@ class DownloadMonitorService : Service() {
         }
 
         startDirectoryAndMediaWatchers()
-        RuntimeStateStore.appendLog("前台实时守护已启动（已监听 ${observers.size} 个目录 + MediaStore）")
+        mainHandler.postDelayed(shizukuPollTask, 1500L)
+        RuntimeStateStore.appendLog(
+            "前台实时守护已启动（已监听 ${observers.size} 个目录 + MediaStore${if (RuntimeStateStore.shizukuEnabled) " + Shizuku 私有目录通道" else ""}）"
+        )
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        ShizukuPrivateDirBridge.init(applicationContext)
         if (intent?.action == ACTION_RELOAD_WATCHERS) {
             startDirectoryAndMediaWatchers()
             RuntimeStateStore.appendLog("规则校准后已热重载监听目录（当前 ${observers.size} 个目录 + MediaStore）")
@@ -171,6 +198,7 @@ class DownloadMonitorService : Service() {
 
     override fun onDestroy() {
         mainHandler.removeCallbacks(debouncedScanTask)
+        mainHandler.removeCallbacks(shizukuPollTask)
         observers.forEach { it.stopWatching() }
         observers.clear()
         mediaObserver?.let { contentResolver.unregisterContentObserver(it) }
